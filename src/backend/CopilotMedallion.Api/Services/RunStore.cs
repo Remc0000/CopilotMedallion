@@ -1,0 +1,97 @@
+using Microsoft.Data.Sqlite;
+using CopilotMedallion.Api.Models;
+
+namespace CopilotMedallion.Api.Services;
+
+public interface IRunStore
+{
+    Task<RunInfo> CreateAsync(string runId, string branch, string specUrl,
+                              string sourceLakehouseId, string tablesCsv, string targetLakehouseName);
+    Task<RunInfo?> GetAsync(string runId);
+    Task UpdateStatusAsync(string runId, string status, string? message = null);
+    Task UpdateBuildAsync(string runId, string targetLakehouseId, string? notebookId, string? jobInstanceId);
+}
+
+public class SqliteRunStore : IRunStore
+{
+    private readonly string _connStr;
+
+    public SqliteRunStore(IConfiguration cfg)
+    {
+        var dbPath = Environment.GetEnvironmentVariable("RUN_DB_PATH")
+            ?? Path.Combine(Environment.GetEnvironmentVariable("HOME") ?? AppContext.BaseDirectory, "data", "runs.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+        _connStr = $"Data Source={dbPath}";
+        using var c = new SqliteConnection(_connStr);
+        c.Open();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = @"CREATE TABLE IF NOT EXISTS runs(
+            run_id TEXT PRIMARY KEY, status TEXT, branch TEXT, spec_url TEXT,
+            source_lakehouse_id TEXT, tables_csv TEXT,
+            target_lakehouse_id TEXT, target_lakehouse_name TEXT,
+            notebook_id TEXT, job_instance_id TEXT, message TEXT,
+            created_at TEXT, updated_at TEXT);";
+        cmd.ExecuteNonQuery();
+    }
+
+    public async Task<RunInfo> CreateAsync(string runId, string branch, string specUrl,
+                                            string sourceLakehouseId, string tablesCsv, string targetLakehouseName)
+    {
+        var now = DateTime.UtcNow.ToString("o");
+        await using var c = new SqliteConnection(_connStr); await c.OpenAsync();
+        var cmd = c.CreateCommand();
+        cmd.CommandText = @"INSERT INTO runs(run_id,status,branch,spec_url,source_lakehouse_id,tables_csv,target_lakehouse_name,created_at,updated_at)
+                            VALUES($id,'SpecsReady',$br,$su,$sl,$tc,$tl,$ts,$ts)";
+        cmd.Parameters.AddWithValue("$id", runId);
+        cmd.Parameters.AddWithValue("$br", branch);
+        cmd.Parameters.AddWithValue("$su", specUrl);
+        cmd.Parameters.AddWithValue("$sl", sourceLakehouseId);
+        cmd.Parameters.AddWithValue("$tc", tablesCsv);
+        cmd.Parameters.AddWithValue("$tl", targetLakehouseName);
+        cmd.Parameters.AddWithValue("$ts", now);
+        await cmd.ExecuteNonQueryAsync();
+        return (await GetAsync(runId))!;
+    }
+
+    public async Task<RunInfo?> GetAsync(string runId)
+    {
+        await using var c = new SqliteConnection(_connStr); await c.OpenAsync();
+        var cmd = c.CreateCommand();
+        cmd.CommandText = @"SELECT run_id,status,branch,spec_url,source_lakehouse_id,tables_csv,
+                                   target_lakehouse_id,target_lakehouse_name,notebook_id,job_instance_id,message,
+                                   created_at,updated_at FROM runs WHERE run_id=$id";
+        cmd.Parameters.AddWithValue("$id", runId);
+        using var r = await cmd.ExecuteReaderAsync();
+        if (!await r.ReadAsync()) return null;
+        string? s(int i) => r.IsDBNull(i) ? null : r.GetString(i);
+        return new RunInfo(
+            r.GetString(0), r.GetString(1), s(2), s(3), s(4), s(5),
+            s(6), s(7), s(8), s(9), s(10),
+            DateTime.Parse(r.GetString(11)), DateTime.Parse(r.GetString(12)));
+    }
+
+    public async Task UpdateStatusAsync(string runId, string status, string? message = null)
+    {
+        await using var c = new SqliteConnection(_connStr); await c.OpenAsync();
+        var cmd = c.CreateCommand();
+        cmd.CommandText = "UPDATE runs SET status=$s, message=$m, updated_at=$ts WHERE run_id=$id";
+        cmd.Parameters.AddWithValue("$s", status);
+        cmd.Parameters.AddWithValue("$m", (object?)message ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$ts", DateTime.UtcNow.ToString("o"));
+        cmd.Parameters.AddWithValue("$id", runId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task UpdateBuildAsync(string runId, string targetLakehouseId, string? notebookId, string? jobInstanceId)
+    {
+        await using var c = new SqliteConnection(_connStr); await c.OpenAsync();
+        var cmd = c.CreateCommand();
+        cmd.CommandText = "UPDATE runs SET target_lakehouse_id=$t, notebook_id=$n, job_instance_id=$j, updated_at=$ts WHERE run_id=$id";
+        cmd.Parameters.AddWithValue("$t", (object?)targetLakehouseId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$n", (object?)notebookId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$j", (object?)jobInstanceId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$ts", DateTime.UtcNow.ToString("o"));
+        cmd.Parameters.AddWithValue("$id", runId);
+        await cmd.ExecuteNonQueryAsync();
+    }
+}
