@@ -34,20 +34,32 @@ public class GitHubService
         var branch = $"run/{runId}";
         var path = $"runs/{runId}/spec.md";
 
-        // get default branch sha
+        // Ensure repo has at least one commit (Octokit's Reference.Get fails on empty repos).
         var repo = await client.Repository.Get(_owner, _runsRepo);
-        var defaultBranchRef = await client.Git.Reference.Get(_owner, _runsRepo, $"heads/{repo.DefaultBranch}");
-
-        // create branch (ignore if exists)
+        Octokit.Reference defaultBranchRef;
         try
         {
-            await client.Git.Reference.Create(_owner, _runsRepo, new NewReference($"refs/heads/{branch}", defaultBranchRef.Object.Sha));
+            defaultBranchRef = await client.Git.Reference.Get(_owner, _runsRepo, $"heads/{repo.DefaultBranch}");
         }
-        catch (ApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.UnprocessableEntity) { /* already exists */ }
+        catch (ApiException ex) when (ex.HttpResponse != null && (int)ex.HttpResponse.StatusCode == 409)
+        {
+            // Empty repo — seed it with a README so we have a base ref.
+            await client.Repository.Content.CreateFile(_owner, _runsRepo, "README.md",
+                new CreateFileRequest("chore: seed repo",
+                    "# CopilotMedallion run specs\n\nAuto-populated by https://copilot.roesli.org.",
+                    repo.DefaultBranch ?? "main"));
+            defaultBranchRef = await client.Git.Reference.Get(_owner, _runsRepo, $"heads/{repo.DefaultBranch ?? "main"}");
+        }
 
-        // create file on branch
-        var create = new CreateFileRequest($"Add spec for run {runId}", specMarkdown, branch);
-        await client.Repository.Content.CreateFile(_owner, _runsRepo, path, create);
+        try
+        {
+            await client.Git.Reference.Create(_owner, _runsRepo,
+                new NewReference($"refs/heads/{branch}", defaultBranchRef.Object.Sha));
+        }
+        catch (ApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.UnprocessableEntity) { /* branch already exists */ }
+
+        await client.Repository.Content.CreateFile(_owner, _runsRepo, path,
+            new CreateFileRequest($"Add spec for run {runId}", specMarkdown, branch));
 
         var blobUrl = $"https://github.com/{_owner}/{_runsRepo}/blob/{branch}/{path}";
         var rawUrl = $"https://raw.githubusercontent.com/{_owner}/{_runsRepo}/{branch}/{path}";
