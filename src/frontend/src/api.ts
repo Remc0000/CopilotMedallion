@@ -12,8 +12,17 @@ export async function getFabricToken(pca: IPublicClientApplication, scope: strin
 }
 
 export async function getOnelakeToken(pca: IPublicClientApplication): Promise<string | null> {
-  try { return await getToken(pca, 'https://storage.azure.com/.default') }
-  catch { return null }
+  const accounts = pca.getAllAccounts()
+  if (accounts.length === 0) return null
+  try {
+    const res = await pca.acquireTokenSilent({ scopes: ['https://storage.azure.com/.default'], account: accounts[0] })
+    return res.accessToken
+  } catch {
+    try {
+      const res = await pca.acquireTokenPopup({ scopes: ['https://storage.azure.com/.default'], account: accounts[0] })
+      return res.accessToken
+    } catch { return null }
+  }
 }
 
 export async function api<T>(path: string, fabricToken: string, init?: RequestInit, onelakeToken?: string | null): Promise<T> {

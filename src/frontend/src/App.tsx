@@ -35,14 +35,18 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   async function signIn() {
     setError(null)
     try {
-      await instance.loginPopup({ scopes: [appConfig.scope, 'https://storage.azure.com/.default'] })
+      await instance.loginPopup({ scopes: [appConfig.scope] })
     } catch (e: any) { setError(e.message ?? String(e)) }
   }
 
   async function ensureToken() {
     const t = await getFabricToken(instance, appConfig.scope)
     setToken(t)
-    const olt = await getOnelakeToken(instance)
+    // OneLake token is acquired lazily/best-effort; one resource per request.
+    let olt: string | null = null
+    try {
+      olt = await getOnelakeToken(instance)
+    } catch { /* will be requested on demand */ }
     setOnelakeToken(olt)
     return { fabric: t, onelake: olt }
   }
