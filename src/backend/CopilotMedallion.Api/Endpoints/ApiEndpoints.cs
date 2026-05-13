@@ -94,7 +94,7 @@ public static class ApiEndpoints
         });
 
         g.MapPost("/build", async ([FromBody] BuildRequest body, HttpRequest req,
-                                     FabricService fabric, IRunStore store, IWebHostEnvironment env, ILogger<FabricService> log) =>
+                                     FabricService fabric, IRunStore store, IWebHostEnvironment env, ILoggerFactory lf) =>
         {
             var tok = req.Headers["X-Fabric-Token"].ToString();
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
@@ -102,35 +102,53 @@ public static class ApiEndpoints
             var run = await store.GetAsync(body.RunId);
             if (run is null) return Results.NotFound();
 
-            await store.UpdateStatusAsync(run.RunId, "CreatingLakehouse");
-            var lake = await fabric.CreateLakehouseAsync(tok, run.TargetLakehouseName!, $"Created by copilot.roesli.org for run {run.RunId}");
+            await store.UpdateStatusAsync(run.RunId, "Queued");
 
-            await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
-            var nbPath = Path.Combine(env.ContentRootPath, "notebooks", "medallion_builder.ipynb");
-            if (!File.Exists(nbPath))
+            // Fire-and-forget: do the long-running work in the background, return immediately.
+            // App Service request timeout (~230s) is shorter than notebook creation can take.
+            var bgLogger = lf.CreateLogger("BuildJob");
+            _ = Task.Run(async () =>
             {
-                var alt = Path.Combine(AppContext.BaseDirectory, "notebooks", "medallion_builder.ipynb");
-                if (File.Exists(alt)) nbPath = alt;
-            }
-            var nbContent = await File.ReadAllTextAsync(nbPath);
-            var notebookId = await fabric.CreateNotebookAsync(tok, $"medallion_builder_{run.RunId}", nbContent);
+                try
+                {
+                    await store.UpdateStatusAsync(run.RunId, "CreatingLakehouse");
+                    var lake = await fabric.CreateLakehouseAsync(tok, run.TargetLakehouseName!,
+                        $"Created by copilot.roesli.org for run {run.RunId}");
 
-            await store.UpdateStatusAsync(run.RunId, "RunningNotebook");
-            var parameters = new Dictionary<string, object>
-            {
-                ["source_lakehouse_id"] = new { value = run.SourceLakehouseId ?? "", type = "string" },
-                ["source_tables_csv"] = new { value = run.TablesCsv ?? "", type = "string" },
-                ["target_lakehouse_id"] = new { value = lake.Id, type = "string" },
-                ["target_lakehouse_name"] = new { value = run.TargetLakehouseName!, type = "string" },
-                ["workspace_id"] = new { value = fabric.WorkspaceId, type = "string" },
-                ["run_id"] = new { value = run.RunId, type = "string" },
-                ["spec_url"] = new { value = run.SpecUrl ?? "", type = "string" }
-            };
-            var instanceId = await fabric.RunNotebookAsync(tok, notebookId, parameters);
+                    await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
+                    var nbPath = Path.Combine(env.ContentRootPath, "notebooks", "medallion_builder.ipynb");
+                    if (!File.Exists(nbPath))
+                    {
+                        var alt = Path.Combine(AppContext.BaseDirectory, "notebooks", "medallion_builder.ipynb");
+                        if (File.Exists(alt)) nbPath = alt;
+                    }
+                    var nbContent = await File.ReadAllTextAsync(nbPath);
+                    var notebookId = await fabric.CreateNotebookAsync(tok, $"medallion_builder_{run.RunId}", nbContent);
 
-            await store.UpdateBuildAsync(run.RunId, lake.Id, notebookId, instanceId);
-            await store.UpdateStatusAsync(run.RunId, "Building", $"Notebook job {instanceId} started");
-            return Results.Ok(await store.GetAsync(run.RunId));
+                    await store.UpdateStatusAsync(run.RunId, "RunningNotebook");
+                    var parameters = new Dictionary<string, object>
+                    {
+                        ["source_lakehouse_id"] = new { value = run.SourceLakehouseId ?? "", type = "string" },
+                        ["source_tables_csv"] = new { value = run.TablesCsv ?? "", type = "string" },
+                        ["target_lakehouse_id"] = new { value = lake.Id, type = "string" },
+                        ["target_lakehouse_name"] = new { value = run.TargetLakehouseName!, type = "string" },
+                        ["workspace_id"] = new { value = fabric.WorkspaceId, type = "string" },
+                        ["run_id"] = new { value = run.RunId, type = "string" },
+                        ["spec_url"] = new { value = run.SpecUrl ?? "", type = "string" }
+                    };
+                    var instanceId = await fabric.RunNotebookAsync(tok, notebookId, parameters);
+
+                    await store.UpdateBuildAsync(run.RunId, lake.Id, notebookId, instanceId);
+                    await store.UpdateStatusAsync(run.RunId, "Building", $"Notebook job {instanceId} started");
+                }
+                catch (Exception ex)
+                {
+                    bgLogger.LogError(ex, "Background build failed for run {runId}", run.RunId);
+                    await store.UpdateStatusAsync(run.RunId, "Failed", ex.Message);
+                }
+            });
+
+            return Results.Accepted($"/api/runs/{run.RunId}", await store.GetAsync(run.RunId));
         });
 
         g.MapGet("/runs/{runId}", async (string runId, HttpRequest req, IRunStore store, FabricService fabric) =>

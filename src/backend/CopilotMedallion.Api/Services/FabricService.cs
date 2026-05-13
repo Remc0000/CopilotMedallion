@@ -136,17 +136,31 @@ public class FabricService
     public async Task<LakehouseInfo> CreateLakehouseAsync(string userToken, string displayName, string? description = null)
     {
         var c = Client(userToken);
-        var body = new { displayName, description = description ?? "" };
-        var resp = await c.PostAsync($"workspaces/{_workspaceId}/lakehouses",
-            new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
-        var raw = await resp.Content.ReadAsStringAsync();
-        if (!resp.IsSuccessStatusCode) throw new Exception($"CreateLakehouse failed {resp.StatusCode}: {raw}");
-        using var doc = JsonDocument.Parse(raw);
-        var e = doc.RootElement;
-        return new LakehouseInfo(e.GetProperty("id").GetString()!,
-                                 e.GetProperty("displayName").GetString()!,
-                                 _workspaceId,
-                                 e.TryGetProperty("description", out var d) ? d.GetString() : null);
+        // Retry with -2, -3 suffixes on conflict (display name already in use).
+        for (int attempt = 1; attempt <= 4; attempt++)
+        {
+            var name = attempt == 1 ? displayName : $"{displayName}_{attempt}";
+            var body = new { displayName = name, description = description ?? "" };
+            var resp = await c.PostAsync($"workspaces/{_workspaceId}/lakehouses",
+                new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
+            var raw = await resp.Content.ReadAsStringAsync();
+            if (resp.IsSuccessStatusCode)
+            {
+                using var doc = JsonDocument.Parse(raw);
+                var e = doc.RootElement;
+                return new LakehouseInfo(e.GetProperty("id").GetString()!,
+                                         e.GetProperty("displayName").GetString()!,
+                                         _workspaceId,
+                                         e.TryGetProperty("description", out var d) ? d.GetString() : null);
+            }
+            if (resp.StatusCode == System.Net.HttpStatusCode.Conflict && raw.Contains("ItemDisplayNameAlreadyInUse"))
+            {
+                _log.LogInformation("Lakehouse '{name}' already exists, retrying with suffix.", name);
+                continue;
+            }
+            throw new Exception($"CreateLakehouse failed {resp.StatusCode}: {raw}");
+        }
+        throw new Exception("CreateLakehouse failed after retries.");
     }
 
     /// <summary>
@@ -178,24 +192,37 @@ public class FabricService
             new StringContent(JsonSerializer.Serialize(platformPayload), Encoding.UTF8, "application/json"));
         var raw = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode) throw new Exception($"CreateNotebook failed {resp.StatusCode}: {raw}");
-        // Fabric may return 202 Location header for long-running; handle both
+        // Fabric may return 202 Location header for long-running; handle both.
         if (resp.StatusCode == System.Net.HttpStatusCode.Accepted)
         {
             var loc = resp.Headers.Location?.ToString();
-            // poll
-            for (int i = 0; i < 30; i++)
+            // poll up to 5 minutes
+            for (int i = 0; i < 60; i++)
             {
-                await Task.Delay(2000);
+                await Task.Delay(5000);
                 var st = await c.GetAsync(loc);
                 var sj = await st.Content.ReadAsStringAsync();
+                if (!st.IsSuccessStatusCode) continue;
                 using var sd = JsonDocument.Parse(sj);
-                if (sd.RootElement.TryGetProperty("status", out var s) && s.GetString() == "Succeeded")
+                var status = sd.RootElement.TryGetProperty("status", out var s) ? s.GetString() : null;
+                if (status == "Succeeded")
                 {
+                    // Result item id may be at /response/id or returned via separate /result endpoint
                     if (sd.RootElement.TryGetProperty("response", out var r) && r.TryGetProperty("id", out var id))
                         return id.GetString()!;
+                    // Try result endpoint
+                    var resultUri = loc!.TrimEnd('/') + "/result";
+                    var rr = await c.GetAsync(resultUri);
+                    var rjson = await rr.Content.ReadAsStringAsync();
+                    using var rd = JsonDocument.Parse(rjson);
+                    if (rd.RootElement.TryGetProperty("id", out var rid))
+                        return rid.GetString()!;
+                    throw new Exception($"CreateNotebook succeeded but couldn't extract id. Body: {sj}");
                 }
+                if (status == "Failed" || status == "Cancelled")
+                    throw new Exception($"CreateNotebook {status}: {sj}");
             }
-            throw new Exception("CreateNotebook polling timed out.");
+            throw new Exception("CreateNotebook polling timed out after 5 minutes.");
         }
         using var doc = JsonDocument.Parse(raw);
         return doc.RootElement.GetProperty("id").GetString()!;
