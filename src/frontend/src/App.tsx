@@ -3,7 +3,7 @@ import { useMsal, useIsAuthenticated } from '@azure/msal-react'
 import {
   Button, Title1, Title3, Body1, Caption1, Dropdown, Option, Input, Label, Spinner,
   Card, CardHeader, makeStyles, tokens, MessageBar, MessageBarBody, MessageBarTitle,
-  Checkbox, Link as FLink
+  Checkbox, Link as FLink, Textarea
 } from '@fluentui/react-components'
 import { AppConfig, Lakehouse, Table, Run, SpecResponse } from './types'
 import { api, getFabricToken, getOnelakeToken } from './api'
@@ -26,6 +26,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const [tables, setTables] = useState<Table[]>([])
   const [selectedTables, setSelectedTables] = useState<Set<string>>(new Set())
   const [targetName, setTargetName] = useState('')
+  const [specDraft, setSpecDraft] = useState('')
+  const [previewRunId, setPreviewRunId] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [busyMsg, setBusyMsg] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -108,9 +110,30 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     return () => clearInterval(id)
   }, [run?.runId, run?.status])
 
+  async function previewSpecs() {
+    if (!sourceId || selectedTables.size === 0) return
+    setError(null); setBusy(true); setBusyMsg('Generating spec template...')
+    try {
+      const { fabric } = await ensureToken()
+      const resp = await api<{ markdown: string; runId: string; targetLakehouseName: string }>(
+        '/api/specs/preview', fabric, {
+          method: 'POST',
+          body: JSON.stringify({
+            sourceLakehouseId: sourceId,
+            tables: Array.from(selectedTables),
+            targetLakehouseName: targetName || null
+          })
+        })
+      setSpecDraft(resp.markdown)
+      setPreviewRunId(resp.runId)
+      if (!targetName) setTargetName(resp.targetLakehouseName)
+    } catch (e: any) { setError(String(e)) }
+    finally { setBusy(false); setBusyMsg('') }
+  }
+
   async function generateSpecs() {
     if (!sourceId || selectedTables.size === 0) return
-    setError(null); setBusy(true); setBusyMsg('Generating specs and pushing to GitHub...')
+    setError(null); setBusy(true); setBusyMsg('Pushing specs to GitHub...')
     try {
       const { fabric } = await ensureToken()
       const resp = await api<SpecResponse>('/api/specs', fabric, {
@@ -118,7 +141,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         body: JSON.stringify({
           sourceLakehouseId: sourceId,
           tables: Array.from(selectedTables),
-          targetLakehouseName: targetName || null
+          targetLakehouseName: targetName || null,
+          specMarkdown: specDraft || null
         })
       })
       setSpecs(resp)
@@ -211,12 +235,35 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                 <Label htmlFor="tn">Target Lakehouse name (optional)</Label>
                 <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(auto-generated)" />
               </div>
-              <div className={s.row}>
-                <Button appearance="primary" disabled={busy || selectedTables.size === 0} onClick={generateSpecs}>
-                  Generate specs
-                </Button>
-                {busy && <Spinner size="tiny" label={busyMsg} />}
-              </div>
+              {!specDraft ? (
+                <div className={s.row}>
+                  <Button appearance="primary" disabled={busy || selectedTables.size === 0} onClick={previewSpecs}>
+                    Preview spec
+                  </Button>
+                  {busy && <Spinner size="tiny" label={busyMsg} />}
+                </div>
+              ) : (
+                <>
+                  <Label htmlFor="spec">Spec (editable) {previewRunId && <Caption1>· run {previewRunId}</Caption1>}</Label>
+                  <Textarea
+                    id="spec"
+                    value={specDraft}
+                    onChange={(_, d) => setSpecDraft(d.value)}
+                    rows={20}
+                    resize="vertical"
+                    style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }}
+                  />
+                  <div className={s.row}>
+                    <Button appearance="primary" disabled={busy} onClick={generateSpecs}>
+                      Push to GitHub
+                    </Button>
+                    <Button disabled={busy} onClick={() => { setSpecDraft(''); setPreviewRunId(null) }}>
+                      Regenerate from template
+                    </Button>
+                    {busy && <Spinner size="tiny" label={busyMsg} />}
+                  </div>
+                </>
+              )}
             </>
           )}
         </Card>

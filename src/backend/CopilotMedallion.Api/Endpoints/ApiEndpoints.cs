@@ -44,6 +44,22 @@ public static class ApiEndpoints
             }
         });
 
+        g.MapPost("/specs/preview", async ([FromBody] PreviewSpecsRequest body, HttpRequest req,
+                                            FabricService fabric, SpecGenerator gen) =>
+        {
+            var tok = req.Headers["X-Fabric-Token"].ToString();
+            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
+            var lakes = await fabric.ListLakehousesAsync(tok);
+            var src = lakes.FirstOrDefault(l => l.Id == body.SourceLakehouseId);
+            if (src is null) return Results.NotFound("source lakehouse not in workspace");
+            var runId = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("n").Substring(0,6)}";
+            var targetName = string.IsNullOrWhiteSpace(body.TargetLakehouseName)
+                ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
+                : body.TargetLakehouseName!;
+            var md = gen.Generate(runId, src, body.Tables, targetName, fabric.WorkspaceId);
+            return Results.Ok(new PreviewSpecsResponse(md, runId, targetName));
+        });
+
         g.MapPost("/specs", async ([FromBody] GenerateSpecsRequest body, HttpRequest req,
                                     FabricService fabric, SpecGenerator gen, GitHubService gh, IRunStore store) =>
         {
@@ -59,7 +75,10 @@ public static class ApiEndpoints
                 ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
                 : body.TargetLakehouseName!;
 
-            var spec = gen.Generate(runId, src, body.Tables, targetName, fabric.WorkspaceId);
+            // Caller-supplied spec markdown wins; otherwise fall back to template.
+            var spec = string.IsNullOrWhiteSpace(body.SpecMarkdown)
+                ? gen.Generate(runId, src, body.Tables, targetName, fabric.WorkspaceId)
+                : body.SpecMarkdown!;
 
             if (!gh.Configured)
             {
