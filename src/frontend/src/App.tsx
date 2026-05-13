@@ -61,22 +61,33 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       .finally(() => { setBusy(false); setBusyMsg('') })
   }, [signedIn])
 
+  async function grantOnelakeAccess() {
+    setError(null); setBusy(true); setBusyMsg('Requesting OneLake consent...')
+    try {
+      const accounts = instance.getAllAccounts()
+      const res = await instance.acquireTokenPopup({
+        scopes: ['https://storage.azure.com/.default'],
+        account: accounts[0]
+      })
+      setOnelakeToken(res.accessToken)
+      // Retry tables if we have a sourceId
+      if (sourceId && token) {
+        const t = await api<Table[]>(`/api/sources/lakehouses/${sourceId}/tables`, token, undefined, res.accessToken)
+        setTables(t)
+      }
+    } catch (e: any) { setError(String(e)) }
+    finally { setBusy(false); setBusyMsg('') }
+  }
+
   useEffect(() => {
     if (!sourceId || !token) return
     setBusy(true); setBusyMsg('Loading tables...')
     setSelectedTables(new Set())
     ;(async () => {
       try {
-        // Always (re)try to obtain a OneLake token here so schema-enabled lakehouses
-        // can be listed. First call may pop a one-time consent dialog.
-        let olt = onelakeToken
-        if (!olt) {
-          olt = await getOnelakeToken(instance)
-          setOnelakeToken(olt)
-        }
-        const t = await api<Table[]>(`/api/sources/lakehouses/${sourceId}/tables`, token, undefined, olt)
+        const t = await api<Table[]>(`/api/sources/lakehouses/${sourceId}/tables`, token, undefined, onelakeToken)
         setTables(t)
-      } catch (e) {
+      } catch (e: any) {
         setError(String(e))
       } finally {
         setBusy(false); setBusyMsg('')
@@ -146,7 +157,26 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
       {error && (
         <MessageBar intent="error">
-          <MessageBarBody><MessageBarTitle>Error</MessageBarTitle> {error}</MessageBarBody>
+          <MessageBarBody>
+            <MessageBarTitle>Error</MessageBarTitle> {error}
+            {error.includes('X-Onelake-Token') || error.includes('OneLake') || error.includes('storage.azure.com') ? (
+              <div style={{ marginTop: 8 }}>
+                <Button appearance="primary" onClick={grantOnelakeAccess}>Grant OneLake access</Button>
+              </div>
+            ) : null}
+          </MessageBarBody>
+        </MessageBar>
+      )}
+
+      {signedIn && !onelakeToken && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            <MessageBarTitle>OneLake access</MessageBarTitle>
+            Schema-enabled lakehouses need a separate OneLake consent.
+            <div style={{ marginTop: 8 }}>
+              <Button onClick={grantOnelakeAccess}>Grant OneLake access</Button>
+            </div>
+          </MessageBarBody>
         </MessageBar>
       )}
 

@@ -1,6 +1,8 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using Azure.Core;
+using Azure.Identity;
 using CopilotMedallion.Api.Models;
 
 namespace CopilotMedallion.Api.Services;
@@ -16,6 +18,8 @@ public class FabricService
     private readonly string _baseUrl;
     private readonly string _workspaceId;
     private readonly ILogger<FabricService> _log;
+    private readonly DefaultAzureCredential _miCred = new DefaultAzureCredential();
+    private (string Token, DateTimeOffset ExpiresOn)? _cachedStorageToken;
 
     public FabricService(IHttpClientFactory http, IConfiguration cfg, ILogger<FabricService> log)
     {
@@ -23,6 +27,15 @@ public class FabricService
         _baseUrl = cfg["Fabric:BaseUrl"] ?? "https://api.fabric.microsoft.com/v1";
         _workspaceId = cfg["Fabric:WorkspaceId"] ?? throw new InvalidOperationException("Fabric:WorkspaceId not set");
         _log = log;
+    }
+
+    private async Task<string> GetServiceStorageTokenAsync()
+    {
+        if (_cachedStorageToken is { } c && c.ExpiresOn > DateTimeOffset.UtcNow.AddMinutes(5))
+            return c.Token;
+        var tok = await _miCred.GetTokenAsync(new TokenRequestContext(new[] { "https://storage.azure.com/.default" }));
+        _cachedStorageToken = (tok.Token, tok.ExpiresOn);
+        return tok.Token;
     }
 
     public string WorkspaceId => _workspaceId;
@@ -79,12 +92,14 @@ public class FabricService
             return result;
         }
 
-        // Schema-enabled lakehouse fallback: list via OneLake DFS
+        // Schema-enabled lakehouse fallback: list via OneLake DFS.
+        // Prefer caller-supplied user token; fall back to App Service MI (workspace Viewer).
         if (json.Contains("UnsupportedOperationForSchemasEnabledLakehouse", StringComparison.OrdinalIgnoreCase))
         {
-            if (string.IsNullOrEmpty(onelakeToken))
-                throw new Exception("Schema-enabled lakehouse: caller must supply X-Onelake-Token header (audience https://storage.azure.com).");
-            return await ListTablesViaOnelakeAsync(onelakeToken, lakehouseId);
+            var tokenForOnelake = !string.IsNullOrEmpty(onelakeToken)
+                ? onelakeToken
+                : await GetServiceStorageTokenAsync();
+            return await ListTablesViaOnelakeAsync(tokenForOnelake, lakehouseId);
         }
 
         throw new Exception($"ListTables failed {resp.StatusCode}: {json}");
