@@ -12,3 +12,7 @@ appsettings.Local.json
 publish/
 .env
 .env.local
+src/backend/publish/
+src/backend/app.zip
+src/backend/CopilotMedallion.Api/wwwroot/assets/
+src/frontend/tsconfig.tsbuildinfo
