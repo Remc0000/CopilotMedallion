@@ -57,24 +57,65 @@ public class FabricService
         return result;
     }
 
-    public async Task<List<SourceTable>> ListTablesAsync(string userToken, string lakehouseId)
+    public async Task<List<SourceTable>> ListTablesAsync(string userToken, string lakehouseId, string? onelakeToken = null)
     {
         var c = Client(userToken);
         var resp = await c.GetAsync($"workspaces/{_workspaceId}/lakehouses/{lakehouseId}/tables");
-        resp.EnsureSuccessStatusCode();
         var json = await resp.Content.ReadAsStringAsync();
-        using var doc = JsonDocument.Parse(json);
-        var result = new List<SourceTable>();
-        if (doc.RootElement.TryGetProperty("data", out var arr))
+
+        if (resp.IsSuccessStatusCode)
         {
-            foreach (var e in arr.EnumerateArray())
+            using var doc = JsonDocument.Parse(json);
+            var result = new List<SourceTable>();
+            if (doc.RootElement.TryGetProperty("data", out var arr))
             {
-                result.Add(new SourceTable(
-                    e.GetProperty("name").GetString()!,
-                    e.TryGetProperty("location", out var loc) ? (loc.GetString() ?? "") : ""));
+                foreach (var e in arr.EnumerateArray())
+                {
+                    result.Add(new SourceTable(
+                        e.GetProperty("name").GetString()!,
+                        e.TryGetProperty("location", out var loc) ? (loc.GetString() ?? "") : ""));
+                }
             }
+            return result;
         }
-        return result;
+
+        // Schema-enabled lakehouse fallback: list via OneLake DFS
+        if (json.Contains("UnsupportedOperationForSchemasEnabledLakehouse", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrEmpty(onelakeToken))
+                throw new Exception("Schema-enabled lakehouse: caller must supply X-Onelake-Token header (audience https://storage.azure.com).");
+            return await ListTablesViaOnelakeAsync(onelakeToken, lakehouseId);
+        }
+
+        throw new Exception($"ListTables failed {resp.StatusCode}: {json}");
+    }
+
+    /// <summary>
+    /// OneLake DFS listing. Discovers tables by finding directories that contain a `_delta_log` child.
+    /// Returns table names as their path under `Tables/` (e.g., `SalesLT/Address`).
+    /// </summary>
+    public async Task<List<SourceTable>> ListTablesViaOnelakeAsync(string onelakeToken, string lakehouseId)
+    {
+        var hc = _http.CreateClient();
+        hc.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", onelakeToken);
+        var url = $"https://onelake.dfs.fabric.microsoft.com/{_workspaceId}/{lakehouseId}/?resource=filesystem&recursive=true&directory=Tables";
+        var resp = await hc.GetAsync(url);
+        var raw = await resp.Content.ReadAsStringAsync();
+        if (!resp.IsSuccessStatusCode) throw new Exception($"OneLake list failed {resp.StatusCode}: {raw}");
+        using var doc = JsonDocument.Parse(raw);
+        var paths = doc.RootElement.GetProperty("paths");
+        var allPaths = new List<string>();
+        foreach (var p in paths.EnumerateArray())
+            allPaths.Add(p.GetProperty("name").GetString() ?? "");
+        // Tables are directories whose immediate child is `_delta_log`
+        var deltaLogs = allPaths
+            .Where(p => p.EndsWith("/_delta_log"))
+            .Select(p => p[..^"/_delta_log".Length])
+            .Select(p => p.StartsWith("Tables/") ? p["Tables/".Length..] : p)
+            .Distinct()
+            .OrderBy(p => p)
+            .ToList();
+        return deltaLogs.Select(n => new SourceTable(n, $"Tables/{n}")).ToList();
     }
 
     public async Task<LakehouseInfo> CreateLakehouseAsync(string userToken, string displayName, string? description = null)

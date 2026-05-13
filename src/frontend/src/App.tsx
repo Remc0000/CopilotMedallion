@@ -6,7 +6,7 @@ import {
   Checkbox, Link as FLink
 } from '@fluentui/react-components'
 import { AppConfig, Lakehouse, Table, Run, SpecResponse } from './types'
-import { api, getFabricToken } from './api'
+import { api, getFabricToken, getOnelakeToken } from './api'
 
 const useStyles = makeStyles({
   shell: { maxWidth: '900px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' },
@@ -20,6 +20,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const { instance } = useMsal()
   const signedIn = useIsAuthenticated()
   const [token, setToken] = useState<string | null>(null)
+  const [onelakeToken, setOnelakeToken] = useState<string | null>(null)
   const [lakes, setLakes] = useState<Lakehouse[]>([])
   const [sourceId, setSourceId] = useState<string | null>(null)
   const [tables, setTables] = useState<Table[]>([])
@@ -34,21 +35,23 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   async function signIn() {
     setError(null)
     try {
-      await instance.loginPopup({ scopes: [appConfig.scope] })
+      await instance.loginPopup({ scopes: [appConfig.scope, 'https://storage.azure.com/.default'] })
     } catch (e: any) { setError(e.message ?? String(e)) }
   }
 
   async function ensureToken() {
     const t = await getFabricToken(instance, appConfig.scope)
     setToken(t)
-    return t
+    const olt = await getOnelakeToken(instance)
+    setOnelakeToken(olt)
+    return { fabric: t, onelake: olt }
   }
 
   useEffect(() => {
     if (!signedIn) return
     setBusy(true); setBusyMsg('Loading lakehouses...')
     ensureToken()
-      .then(t => api<Lakehouse[]>('/api/sources/lakehouses', t))
+      .then(({ fabric }) => api<Lakehouse[]>('/api/sources/lakehouses', fabric))
       .then(setLakes)
       .catch(e => setError(String(e)))
       .finally(() => { setBusy(false); setBusyMsg('') })
@@ -58,19 +61,19 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     if (!sourceId || !token) return
     setBusy(true); setBusyMsg('Loading tables...')
     setSelectedTables(new Set())
-    api<Table[]>(`/api/sources/lakehouses/${sourceId}/tables`, token)
+    api<Table[]>(`/api/sources/lakehouses/${sourceId}/tables`, token, undefined, onelakeToken)
       .then(setTables)
       .catch(e => setError(String(e)))
       .finally(() => { setBusy(false); setBusyMsg('') })
-  }, [sourceId, token])
+  }, [sourceId, token, onelakeToken])
 
   useEffect(() => {
     if (!run) return
     if (['SpecsReady','Succeeded','Failed','Cancelled'].includes(run.status)) return
     const id = setInterval(async () => {
       try {
-        const t = await ensureToken()
-        const r = await api<Run>(`/api/runs/${run.runId}`, t)
+        const { fabric } = await ensureToken()
+        const r = await api<Run>(`/api/runs/${run.runId}`, fabric)
         setRun(r)
       } catch (e) { /* ignore polling errors */ }
     }, 4000)
@@ -81,8 +84,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     if (!sourceId || selectedTables.size === 0) return
     setError(null); setBusy(true); setBusyMsg('Generating specs and pushing to GitHub...')
     try {
-      const t = await ensureToken()
-      const resp = await api<SpecResponse>('/api/specs', t, {
+      const { fabric } = await ensureToken()
+      const resp = await api<SpecResponse>('/api/specs', fabric, {
         method: 'POST',
         body: JSON.stringify({
           sourceLakehouseId: sourceId,
@@ -91,7 +94,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         })
       })
       setSpecs(resp)
-      const r = await api<Run>(`/api/runs/${resp.runId}`, t)
+      const r = await api<Run>(`/api/runs/${resp.runId}`, fabric)
       setRun(r)
     } catch (e: any) { setError(String(e)) }
     finally { setBusy(false); setBusyMsg('') }
@@ -101,8 +104,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     if (!run) return
     setError(null); setBusy(true); setBusyMsg('Creating lakehouse + starting orchestrator notebook...')
     try {
-      const t = await ensureToken()
-      const r = await api<Run>('/api/build', t, {
+      const { fabric } = await ensureToken()
+      const r = await api<Run>('/api/build', fabric, {
         method: 'POST',
         body: JSON.stringify({ runId: run.runId })
       })

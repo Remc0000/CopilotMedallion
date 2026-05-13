@@ -33,7 +33,15 @@ public static class ApiEndpoints
         {
             var tok = req.Headers["X-Fabric-Token"].ToString();
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
-            return Results.Ok(await fabric.ListTablesAsync(tok, id));
+            var onelakeTok = req.Headers["X-Onelake-Token"].ToString();
+            try
+            {
+                return Results.Ok(await fabric.ListTablesAsync(tok, id, string.IsNullOrEmpty(onelakeTok) ? null : onelakeTok));
+            }
+            catch (Exception ex)
+            {
+                return Results.Problem(title: "ListTables failed", detail: ex.Message, statusCode: 500);
+            }
         });
 
         g.MapPost("/specs", async ([FromBody] GenerateSpecsRequest body, HttpRequest req,
