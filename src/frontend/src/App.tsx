@@ -65,11 +65,24 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     if (!sourceId || !token) return
     setBusy(true); setBusyMsg('Loading tables...')
     setSelectedTables(new Set())
-    api<Table[]>(`/api/sources/lakehouses/${sourceId}/tables`, token, undefined, onelakeToken)
-      .then(setTables)
-      .catch(e => setError(String(e)))
-      .finally(() => { setBusy(false); setBusyMsg('') })
-  }, [sourceId, token, onelakeToken])
+    ;(async () => {
+      try {
+        // Always (re)try to obtain a OneLake token here so schema-enabled lakehouses
+        // can be listed. First call may pop a one-time consent dialog.
+        let olt = onelakeToken
+        if (!olt) {
+          olt = await getOnelakeToken(instance)
+          setOnelakeToken(olt)
+        }
+        const t = await api<Table[]>(`/api/sources/lakehouses/${sourceId}/tables`, token, undefined, olt)
+        setTables(t)
+      } catch (e) {
+        setError(String(e))
+      } finally {
+        setBusy(false); setBusyMsg('')
+      }
+    })()
+  }, [sourceId, token])
 
   useEffect(() => {
     if (!run) return
