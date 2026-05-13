@@ -41,6 +41,12 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     } catch (e: any) { setError(e.message ?? String(e)) }
   }
 
+  async function signOut() {
+    sessionStorage.clear()
+    try { await instance.logoutPopup({ postLogoutRedirectUri: window.location.origin }) }
+    catch { /* ignore */ }
+  }
+
   async function ensureToken() {
     const t = await getFabricToken(instance, appConfig.scope)
     setToken(t)
@@ -170,7 +176,10 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     <div className={s.shell}>
       <Title1>🛠️ Copilot Medallion</Title1>
       <Body1>Automated Bronze/Silver/Gold + report build for Microsoft Fabric.</Body1>
-      <Caption1>Workspace: <code>{appConfig.workspaceId}</code> · Specs repo: <code>{appConfig.runsRepo}</code></Caption1>
+      <Caption1>
+        Workspace: <code>{appConfig.workspaceId}</code> · Specs repo: <code>{appConfig.runsRepo}</code>
+        {signedIn && <> · <FLink onClick={signOut} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>Sign out</FLink></>}
+      </Caption1>
 
       {!signedIn && (
         <Card>

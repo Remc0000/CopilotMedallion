@@ -1,14 +1,19 @@
 import { IPublicClientApplication } from '@azure/msal-browser'
 
-export async function getToken(pca: IPublicClientApplication, scope: string): Promise<string> {
+export async function getToken(pca: IPublicClientApplication, scope: string, forceRefresh = false): Promise<string> {
   const accounts = pca.getAllAccounts()
   if (accounts.length === 0) throw new Error('no account')
-  const res = await pca.acquireTokenSilent({ scopes: [scope], account: accounts[0] })
+  const res = await pca.acquireTokenSilent({ scopes: [scope], account: accounts[0], forceRefresh })
   return res.accessToken
 }
 
 export async function getFabricToken(pca: IPublicClientApplication, scope: string): Promise<string> {
-  return getToken(pca, scope)
+  // Force refresh once per session so newly-granted scopes (e.g. Item.Execute.All) are picked up.
+  const key = 'fabricTokenRefreshed:v2'
+  const force = !sessionStorage.getItem(key)
+  const tok = await getToken(pca, scope, force)
+  if (force) sessionStorage.setItem(key, '1')
+  return tok
 }
 
 export async function getOnelakeToken(pca: IPublicClientApplication): Promise<string | null> {
