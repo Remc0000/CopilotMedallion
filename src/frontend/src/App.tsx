@@ -307,7 +307,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               <MessageBarBody><MessageBarTitle>{run.status}</MessageBarTitle> {run.message ?? ''}</MessageBarBody>
             </MessageBar>
           )}
-          {['Queued','CreatingLakehouse','DeployingNotebook','RunningNotebook','Building'].includes(run.status) && (
+          {['Queued','GeneratingNotebook','CreatingLakehouse','DeployingNotebook','RunningNotebook','Building'].includes(run.status) && (
             <Spinner label={`Building... (${run.status})`} />
           )}
         </Card>

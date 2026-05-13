@@ -94,7 +94,8 @@ public static class ApiEndpoints
         });
 
         g.MapPost("/build", async ([FromBody] BuildRequest body, HttpRequest req,
-                                     FabricService fabric, IRunStore store, IWebHostEnvironment env, ILoggerFactory lf) =>
+                                     FabricService fabric, IRunStore store, IWebHostEnvironment env,
+                                     NotebookBuilder builder, ILoggerFactory lf) =>
         {
             var tok = req.Headers["X-Fabric-Token"].ToString();
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
@@ -104,8 +105,6 @@ public static class ApiEndpoints
 
             await store.UpdateStatusAsync(run.RunId, "Queued");
 
-            // Fire-and-forget: do the long-running work in the background, return immediately.
-            // App Service request timeout (~230s) is shorter than notebook creation can take.
             var bgLogger = lf.CreateLogger("BuildJob");
             _ = Task.Run(async () =>
             {
@@ -115,14 +114,34 @@ public static class ApiEndpoints
                     var lake = await fabric.CreateLakehouseAsync(tok, run.TargetLakehouseName!,
                         $"Created by copilot.roesli.org for run {run.RunId}");
 
-                    await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
-                    var nbPath = Path.Combine(env.ContentRootPath, "notebooks", "medallion_builder.ipynb");
-                    if (!File.Exists(nbPath))
+                    // Try to fetch the user's spec and ask the LLM for cells. Fall back to the
+                    // checked-in template notebook if that fails.
+                    await store.UpdateStatusAsync(run.RunId, "GeneratingNotebook");
+                    var rawUrl = ToRawUrl(run.SpecUrl);
+                    var spec = await builder.FetchSpecMarkdownAsync(rawUrl);
+                    var tables = (run.TablesCsv ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
+                    string nbContent;
+                    var cells = spec is null ? null : await builder.GenerateCellsFromSpecAsync(
+                        spec, fabric.WorkspaceId, run.SourceLakehouseId ?? "", lake.Id,
+                        run.TargetLakehouseName!, tables, run.RunId);
+                    if (cells is not null && cells.Count > 0)
                     {
-                        var alt = Path.Combine(AppContext.BaseDirectory, "notebooks", "medallion_builder.ipynb");
-                        if (File.Exists(alt)) nbPath = alt;
+                        nbContent = builder.BuildNotebookJson(cells);
+                        bgLogger.LogInformation("Run {r}: using LLM-generated notebook with {n} cells", run.RunId, cells.Count);
                     }
-                    var nbContent = await File.ReadAllTextAsync(nbPath);
+                    else
+                    {
+                        var nbPath = Path.Combine(env.ContentRootPath, "notebooks", "medallion_builder.ipynb");
+                        if (!File.Exists(nbPath))
+                        {
+                            var alt = Path.Combine(AppContext.BaseDirectory, "notebooks", "medallion_builder.ipynb");
+                            if (File.Exists(alt)) nbPath = alt;
+                        }
+                        nbContent = await File.ReadAllTextAsync(nbPath);
+                        bgLogger.LogInformation("Run {r}: using static fallback notebook", run.RunId);
+                    }
+
+                    await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
                     var notebookId = await fabric.CreateNotebookAsync(tok, $"medallion_builder_{run.RunId}", nbContent);
 
                     await store.UpdateStatusAsync(run.RunId, "RunningNotebook");
@@ -150,6 +169,14 @@ public static class ApiEndpoints
 
             return Results.Accepted($"/api/runs/{run.RunId}", await store.GetAsync(run.RunId));
         });
+
+        static string? ToRawUrl(string? blobUrl)
+        {
+            // https://github.com/{o}/{r}/blob/{branch}/path -> https://raw.githubusercontent.com/{o}/{r}/{branch}/path
+            if (string.IsNullOrWhiteSpace(blobUrl) || !blobUrl.StartsWith("https://github.com/")) return blobUrl;
+            return blobUrl.Replace("https://github.com/", "https://raw.githubusercontent.com/")
+                          .Replace("/blob/", "/");
+        }
 
         g.MapGet("/runs/{runId}", async (string runId, HttpRequest req, IRunStore store, FabricService fabric) =>
         {

@@ -10,6 +10,8 @@ builder.Services.AddSingleton<IRunStore, SqliteRunStore>();
 builder.Services.AddSingleton<FabricService>();
 builder.Services.AddSingleton<GitHubService>();
 builder.Services.AddSingleton<SpecGenerator>();
+builder.Services.AddSingleton<LlmService>();
+builder.Services.AddSingleton<NotebookBuilder>();
 builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
     p.WithOrigins("http://localhost:5173").AllowAnyHeader().AllowAnyMethod().AllowCredentials()));
 
