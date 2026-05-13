@@ -122,11 +122,16 @@ public class FabricService
         var allPaths = new List<string>();
         foreach (var p in paths.EnumerateArray())
             allPaths.Add(p.GetProperty("name").GetString() ?? "");
-        // Tables are directories whose immediate child is `_delta_log`
+        // Tables are directories whose immediate child is `_delta_log`.
+        // OneLake DFS listing for schema-enabled lakehouses sometimes prepends an extra
+        // `Tables/` to paths, so strip up to two leading `Tables/` segments to get the
+        // path Spark actually reads (e.g. real: `Tables/SalesLT/Address`, listed: `Tables/Tables/SalesLT/Address`).
         var deltaLogs = allPaths
             .Where(p => p.EndsWith("/_delta_log"))
             .Select(p => p[..^"/_delta_log".Length])
-            .Select(p => p.StartsWith("Tables/") ? p["Tables/".Length..] : p)
+            .Select(p => p.StartsWith("Tables/Tables/") ? p["Tables/Tables/".Length..]
+                       : p.StartsWith("Tables/") ? p["Tables/".Length..]
+                       : p)
             .Distinct()
             .OrderBy(p => p)
             .ToList();
