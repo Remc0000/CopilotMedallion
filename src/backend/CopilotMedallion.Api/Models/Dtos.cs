@@ -19,6 +19,7 @@ public record RunInfo(
     string Status,
     string? Branch,
     string? SpecUrl,
+    string? WorkspaceId,
     string? SourceLakehouseId,
     string? TablesCsv,
     string? TargetLakehouseId,

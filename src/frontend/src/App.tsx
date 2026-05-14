@@ -6,7 +6,7 @@ import {
   Checkbox, Link as FLink, Textarea
 } from '@fluentui/react-components'
 import { AppConfig, Lakehouse, Table, Run, SpecResponse } from './types'
-import { api, getFabricToken, getOnelakeToken, inFabric } from './api'
+import { api, getFabricToken, getOnelakeToken, inFabric, fabricWorkspaceId } from './api'
 
 const useStyles = makeStyles({
   shell: { maxWidth: '900px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' },
@@ -194,7 +194,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       <Title1>🛠️ Copilot Medallion</Title1>
       <Body1>Automated Bronze/Silver/Gold + report build for Microsoft Fabric.</Body1>
       <Caption1>
-        Workspace: <code>{appConfig.workspaceId}</code> · Specs repo: <code>{appConfig.runsRepo}</code>
+        Workspace: <code>{fabricWorkspaceId || appConfig.workspaceId}</code> · Specs repo: <code>{appConfig.runsRepo}</code>
         {signedIn && <> · <FLink onClick={signOut} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>Sign out</FLink></>}
       </Caption1>
 

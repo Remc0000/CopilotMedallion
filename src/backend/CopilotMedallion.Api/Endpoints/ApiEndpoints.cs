@@ -7,6 +7,8 @@ namespace CopilotMedallion.Api.Endpoints;
 
 public static class ApiEndpoints
 {
+    private const string WorkspaceHeader = "X-Fabric-Workspace-Id";
+
     public static IEndpointRouteBuilder MapApiEndpoints(this IEndpointRouteBuilder app)
     {
         var g = app.MapGroup("/api");
@@ -22,11 +24,16 @@ public static class ApiEndpoints
             runsRepo = $"{cfg["GitHub:Owner"]}/{cfg["GitHub:RunsRepo"]}"
         }));
 
+        static string? Ws(HttpRequest req) {
+            var v = req.Headers[WorkspaceHeader].ToString();
+            return string.IsNullOrWhiteSpace(v) ? null : v;
+        }
+
         g.MapGet("/sources/lakehouses", async (HttpRequest req, FabricService fabric) =>
         {
             var tok = req.Headers["X-Fabric-Token"].ToString();
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
-            return Results.Ok(await fabric.ListLakehousesAsync(tok));
+            return Results.Ok(await fabric.ListLakehousesAsync(tok, Ws(req)));
         });
 
         g.MapGet("/sources/lakehouses/{id}/tables", async (string id, HttpRequest req, FabricService fabric) =>
@@ -36,7 +43,8 @@ public static class ApiEndpoints
             var onelakeTok = req.Headers["X-Onelake-Token"].ToString();
             try
             {
-                return Results.Ok(await fabric.ListTablesAsync(tok, id, string.IsNullOrEmpty(onelakeTok) ? null : onelakeTok));
+                return Results.Ok(await fabric.ListTablesAsync(tok, id,
+                    string.IsNullOrEmpty(onelakeTok) ? null : onelakeTok, Ws(req)));
             }
             catch (Exception ex)
             {
@@ -49,14 +57,15 @@ public static class ApiEndpoints
         {
             var tok = req.Headers["X-Fabric-Token"].ToString();
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
-            var lakes = await fabric.ListLakehousesAsync(tok);
+            var ws = fabric.ResolveWorkspaceId(Ws(req));
+            var lakes = await fabric.ListLakehousesAsync(tok, ws);
             var src = lakes.FirstOrDefault(l => l.Id == body.SourceLakehouseId);
             if (src is null) return Results.NotFound("source lakehouse not in workspace");
             var runId = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("n").Substring(0,6)}";
             var targetName = string.IsNullOrWhiteSpace(body.TargetLakehouseName)
                 ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
                 : body.TargetLakehouseName!;
-            var md = gen.Generate(runId, src, body.Tables, targetName, fabric.WorkspaceId);
+            var md = gen.Generate(runId, src, body.Tables, targetName, ws);
             return Results.Ok(new PreviewSpecsResponse(md, runId, targetName));
         });
 
@@ -66,7 +75,8 @@ public static class ApiEndpoints
             var tok = req.Headers["X-Fabric-Token"].ToString();
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
 
-            var lakes = await fabric.ListLakehousesAsync(tok);
+            var ws = fabric.ResolveWorkspaceId(Ws(req));
+            var lakes = await fabric.ListLakehousesAsync(tok, ws);
             var src = lakes.FirstOrDefault(l => l.Id == body.SourceLakehouseId);
             if (src is null) return Results.NotFound("source lakehouse not in workspace");
 
@@ -75,21 +85,20 @@ public static class ApiEndpoints
                 ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
                 : body.TargetLakehouseName!;
 
-            // Caller-supplied spec markdown wins; otherwise fall back to template.
             var spec = string.IsNullOrWhiteSpace(body.SpecMarkdown)
-                ? gen.Generate(runId, src, body.Tables, targetName, fabric.WorkspaceId)
+                ? gen.Generate(runId, src, body.Tables, targetName, ws)
                 : body.SpecMarkdown!;
 
             if (!gh.Configured)
             {
                 await store.CreateAsync(runId, "(local)", "(GITHUB_PAT not configured)",
-                                         body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
+                                         ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
                 return Results.Ok(new GenerateSpecsResponse(runId, "(local)", "(GITHUB_PAT not configured)", "(local)"));
             }
 
             var (branch, blobUrl, rawUrl) = await gh.PushSpecAsync(runId, spec);
             await store.CreateAsync(runId, branch, blobUrl,
-                                     body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
+                                     ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
             return Results.Ok(new GenerateSpecsResponse(runId, branch, blobUrl, rawUrl));
         });
 
@@ -103,6 +112,9 @@ public static class ApiEndpoints
             var run = await store.GetAsync(body.RunId);
             if (run is null) return Results.NotFound();
 
+            // Use the workspace the run was created in (falls back to header or config).
+            var ws = !string.IsNullOrWhiteSpace(run.WorkspaceId) ? run.WorkspaceId : fabric.ResolveWorkspaceId(Ws(req));
+
             await store.UpdateStatusAsync(run.RunId, "Queued");
 
             var bgLogger = lf.CreateLogger("BuildJob");
@@ -112,17 +124,15 @@ public static class ApiEndpoints
                 {
                     await store.UpdateStatusAsync(run.RunId, "CreatingLakehouse");
                     var lake = await fabric.CreateLakehouseAsync(tok, run.TargetLakehouseName!,
-                        $"Created by copilot.roesli.org for run {run.RunId}");
+                        $"Created by copilot.roesli.org for run {run.RunId}", ws);
 
-                    // Try to fetch the user's spec and ask the LLM for cells. Fall back to the
-                    // checked-in template notebook if that fails.
                     await store.UpdateStatusAsync(run.RunId, "GeneratingNotebook");
                     var rawUrl = ToRawUrl(run.SpecUrl);
                     var spec = await builder.FetchSpecMarkdownAsync(rawUrl);
                     var tables = (run.TablesCsv ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
                     string nbContent;
                     var cells = spec is null ? null : await builder.GenerateCellsFromSpecAsync(
-                        spec, fabric.WorkspaceId, run.SourceLakehouseId ?? "", lake.Id,
+                        spec, ws, run.SourceLakehouseId ?? "", lake.Id,
                         run.TargetLakehouseName!, tables, run.RunId);
                     if (cells is not null && cells.Count > 0)
                     {
@@ -142,7 +152,7 @@ public static class ApiEndpoints
                     }
 
                     await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
-                    var notebookId = await fabric.CreateNotebookAsync(tok, $"medallion_builder_{run.RunId}", nbContent);
+                    var notebookId = await fabric.CreateNotebookAsync(tok, $"medallion_builder_{run.RunId}", nbContent, ws);
 
                     await store.UpdateStatusAsync(run.RunId, "RunningNotebook");
                     var parameters = new Dictionary<string, object>
@@ -151,11 +161,11 @@ public static class ApiEndpoints
                         ["source_tables_csv"] = new { value = run.TablesCsv ?? "", type = "string" },
                         ["target_lakehouse_id"] = new { value = lake.Id, type = "string" },
                         ["target_lakehouse_name"] = new { value = run.TargetLakehouseName!, type = "string" },
-                        ["workspace_id"] = new { value = fabric.WorkspaceId, type = "string" },
+                        ["workspace_id"] = new { value = ws, type = "string" },
                         ["run_id"] = new { value = run.RunId, type = "string" },
                         ["spec_url"] = new { value = run.SpecUrl ?? "", type = "string" }
                     };
-                    var instanceId = await fabric.RunNotebookAsync(tok, notebookId, parameters);
+                    var instanceId = await fabric.RunNotebookAsync(tok, notebookId, parameters, ws);
 
                     await store.UpdateBuildAsync(run.RunId, lake.Id, notebookId, instanceId);
                     await store.UpdateStatusAsync(run.RunId, "Building", $"Notebook job {instanceId} started");
@@ -172,7 +182,6 @@ public static class ApiEndpoints
 
         static string? ToRawUrl(string? blobUrl)
         {
-            // https://github.com/{o}/{r}/blob/{branch}/path -> https://raw.githubusercontent.com/{o}/{r}/{branch}/path
             if (string.IsNullOrWhiteSpace(blobUrl) || !blobUrl.StartsWith("https://github.com/")) return blobUrl;
             return blobUrl.Replace("https://github.com/", "https://raw.githubusercontent.com/")
                           .Replace("/blob/", "/");
@@ -187,7 +196,7 @@ public static class ApiEndpoints
                 var tok = req.Headers["X-Fabric-Token"].ToString();
                 if (!string.IsNullOrEmpty(tok))
                 {
-                    var (st, fail) = await fabric.GetJobStatusAsync(tok, run.NotebookId, run.JobInstanceId);
+                    var (st, fail) = await fabric.GetJobStatusAsync(tok, run.NotebookId, run.JobInstanceId, run.WorkspaceId);
                     if (st == "Completed") await store.UpdateStatusAsync(runId, "Succeeded");
                     else if (st == "Failed" || st == "Cancelled") await store.UpdateStatusAsync(runId, st, fail);
                     run = await store.GetAsync(runId);
