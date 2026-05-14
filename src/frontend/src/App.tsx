@@ -6,7 +6,7 @@ import {
   Checkbox, Link as FLink, Textarea
 } from '@fluentui/react-components'
 import { AppConfig, Lakehouse, Table, Run, SpecResponse } from './types'
-import { api, getFabricToken, getOnelakeToken } from './api'
+import { api, getFabricToken, getOnelakeToken, inFabric } from './api'
 
 const useStyles = makeStyles({
   shell: { maxWidth: '900px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' },
@@ -34,33 +34,16 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const [specs, setSpecs] = useState<SpecResponse | null>(null)
   const [run, setRun] = useState<Run | null>(null)
 
-  const inFabric = new URLSearchParams(window.location.search).get('inFabric') === '1'
+  const inFabricRuntime = inFabric  // imported from api.ts
+  const [fabricSignedIn, setFabricSignedIn] = useState(false)
+  const effectivelySignedIn = signedIn || fabricSignedIn
 
   async function signIn() {
     setError(null)
     try {
-      if (inFabric) {
-        // Inside Fabric iframe: popups are blocked. Use redirect.
-        await instance.loginRedirect({ scopes: [appConfig.scope] })
-      } else {
-        await instance.loginPopup({ scopes: [appConfig.scope] })
-      }
+      await instance.loginPopup({ scopes: [appConfig.scope] })
     } catch (e: any) { setError(e.message ?? String(e)) }
   }
-
-  // When loaded inside Fabric, try silent SSO immediately so the user never sees a button.
-  useEffect(() => {
-    if (!inFabric || signedIn) return
-    ;(async () => {
-      try {
-        const res = await instance.ssoSilent({ scopes: [appConfig.scope] })
-        if (res && res.account) instance.setActiveAccount(res.account)
-      } catch {
-        // Fallback to redirect (still no popup; the iframe just redirects to login + back).
-        try { await instance.loginRedirect({ scopes: [appConfig.scope] }) } catch (e:any) { setError(String(e)) }
-      }
-    })()
-  }, [inFabric, signedIn])
 
   async function signOut() {
     sessionStorage.clear()
@@ -68,27 +51,40 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     catch { /* ignore */ }
   }
 
+  // When loaded inside Fabric: wait for the workload host to postMessage a Fabric token,
+  // then mark "signed in" and proceed. No MSAL popup is used inside the iframe.
+  useEffect(() => {
+    if (!inFabricRuntime || fabricSignedIn) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        await getFabricToken(instance, appConfig.scope)
+        if (!cancelled) setFabricSignedIn(true)
+      } catch (e: any) {
+        if (!cancelled) setError(`Fabric host did not provide a token: ${e?.message ?? e}`)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [inFabricRuntime])
+
   async function ensureToken() {
     const t = await getFabricToken(instance, appConfig.scope)
     setToken(t)
-    // OneLake token is acquired lazily/best-effort; one resource per request.
     let olt: string | null = null
-    try {
-      olt = await getOnelakeToken(instance)
-    } catch { /* will be requested on demand */ }
+    try { olt = await getOnelakeToken(instance) } catch { /* optional */ }
     setOnelakeToken(olt)
     return { fabric: t, onelake: olt }
   }
 
   useEffect(() => {
-    if (!signedIn) return
+    if (!effectivelySignedIn) return
     setBusy(true); setBusyMsg('Loading lakehouses...')
     ensureToken()
       .then(({ fabric }) => api<Lakehouse[]>('/api/sources/lakehouses', fabric))
       .then(setLakes)
       .catch(e => setError(String(e)))
       .finally(() => { setBusy(false); setBusyMsg('') })
-  }, [signedIn])
+  }, [effectivelySignedIn])
 
   async function grantOnelakeAccess() {
     setError(null); setBusy(true); setBusyMsg('Requesting OneLake consent...')
@@ -202,15 +198,15 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         {signedIn && <> · <FLink onClick={signOut} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>Sign out</FLink></>}
       </Caption1>
 
-      {!signedIn && !inFabric && (
+      {!effectivelySignedIn && !inFabricRuntime && (
         <Card>
           <CardHeader header={<Title3>Sign in</Title3>} description={<Body1>Use your Entra account that has access to the Fabric workspace.</Body1>} />
           <Button appearance="primary" onClick={signIn}>Sign in with Microsoft</Button>
         </Card>
       )}
 
-      {!signedIn && inFabric && (
-        <Spinner label="Signing in via Fabric..." />
+      {!effectivelySignedIn && inFabricRuntime && (
+        <Spinner label="Connecting to Fabric..." />
       )}
 
       {error && (
@@ -226,7 +222,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         </MessageBar>
       )}
 
-      {signedIn && !onelakeToken && (
+      {effectivelySignedIn && !onelakeToken && !inFabricRuntime && (
         <MessageBar intent="info">
           <MessageBarBody>
             <MessageBarTitle>OneLake access</MessageBarTitle>
@@ -238,7 +234,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         </MessageBar>
       )}
 
-      {signedIn && !run && (
+      {effectivelySignedIn && !run && (
         <Card>
           <CardHeader header={<Title3>1. Pick source &amp; tables</Title3>} />
           <div className={s.row}>

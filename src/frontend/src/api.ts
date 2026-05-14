@@ -1,5 +1,35 @@
 import { IPublicClientApplication } from '@azure/msal-browser'
 
+let fabricTokenFromHost: string | null = null
+let storageTokenFromHost: string | null = null
+
+export const inFabric = new URLSearchParams(window.location.search).get('inFabric') === '1'
+
+// When running inside a Fabric workload iframe, the outer page sends tokens via postMessage.
+// We send a "ready" once on load and on each request, since the outer side keeps the latest.
+if (inFabric) {
+  window.addEventListener('message', (ev) => {
+    if (ev.data?.type === 'copilot-medallion-tokens') {
+      if (ev.data.fabricToken) fabricTokenFromHost = ev.data.fabricToken
+      if (ev.data.storageToken) storageTokenFromHost = ev.data.storageToken
+    }
+  })
+  window.parent?.postMessage({ type: 'copilot-medallion-ready' }, '*')
+}
+
+function waitForFabricToken(timeoutMs = 15000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (fabricTokenFromHost) return resolve(fabricTokenFromHost)
+    const start = Date.now()
+    const t = setInterval(() => {
+      if (fabricTokenFromHost) { clearInterval(t); resolve(fabricTokenFromHost) }
+      else if (Date.now() - start > timeoutMs) { clearInterval(t); reject(new Error('Fabric host did not provide a token in time')) }
+    }, 200)
+    // nudge the host again
+    window.parent?.postMessage({ type: 'copilot-medallion-ready' }, '*')
+  })
+}
+
 export async function getToken(pca: IPublicClientApplication, scope: string, forceRefresh = false): Promise<string> {
   const accounts = pca.getAllAccounts()
   if (accounts.length === 0) throw new Error('no account')
@@ -8,7 +38,7 @@ export async function getToken(pca: IPublicClientApplication, scope: string, for
 }
 
 export async function getFabricToken(pca: IPublicClientApplication, scope: string): Promise<string> {
-  // Force refresh once per session so newly-granted scopes (e.g. Item.Execute.All) are picked up.
+  if (inFabric) return waitForFabricToken()
   const key = 'fabricTokenRefreshed:v2'
   const force = !sessionStorage.getItem(key)
   const tok = await getToken(pca, scope, force)
@@ -17,6 +47,7 @@ export async function getFabricToken(pca: IPublicClientApplication, scope: strin
 }
 
 export async function getOnelakeToken(pca: IPublicClientApplication): Promise<string | null> {
+  if (inFabric) return storageTokenFromHost
   const accounts = pca.getAllAccounts()
   if (accounts.length === 0) return null
   try {
