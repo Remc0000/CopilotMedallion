@@ -43,7 +43,6 @@ public class GitHubService
         }
         catch (ApiException ex) when (ex.HttpResponse != null && (int)ex.HttpResponse.StatusCode == 409)
         {
-            // Empty repo — seed it with a README so we have a base ref.
             await client.Repository.Content.CreateFile(_owner, _runsRepo, "README.md",
                 new CreateFileRequest("chore: seed repo",
                     "# CopilotMedallion run specs\n\nAuto-populated by https://copilot.roesli.org.",
@@ -58,8 +57,22 @@ public class GitHubService
         }
         catch (ApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.UnprocessableEntity) { /* branch already exists */ }
 
-        await client.Repository.Content.CreateFile(_owner, _runsRepo, path,
-            new CreateFileRequest($"Add spec for run {runId}", specMarkdown, branch));
+        // Create-or-update the spec file on this branch.
+        try
+        {
+            await client.Repository.Content.CreateFile(_owner, _runsRepo, path,
+                new CreateFileRequest($"Add spec for run {runId}", specMarkdown, branch));
+        }
+        catch (ApiException ex) when (ex.StatusCode == System.Net.HttpStatusCode.UnprocessableEntity ||
+                                       ex.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            // File already exists — update it.
+            var existing = await client.Repository.Content.GetAllContentsByRef(_owner, _runsRepo, path, branch);
+            var sha = existing.FirstOrDefault()?.Sha;
+            if (sha is null) throw;
+            await client.Repository.Content.UpdateFile(_owner, _runsRepo, path,
+                new UpdateFileRequest($"Update spec for run {runId}", specMarkdown, sha, branch));
+        }
 
         var blobUrl = $"https://github.com/{_owner}/{_runsRepo}/blob/{branch}/{path}";
         var rawUrl = $"https://raw.githubusercontent.com/{_owner}/{_runsRepo}/{branch}/{path}";

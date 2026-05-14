@@ -156,7 +156,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
   async function generateSpecs() {
     if (!sourceId || selectedTables.size === 0) return
-    setError(null); setBusy(true); setBusyMsg('Pushing specs to GitHub...')
+    setError(null); setBusy(true); setBusyMsg(run ? 'Updating spec on GitHub...' : 'Pushing specs to GitHub...')
     try {
       const { fabric } = await ensureToken()
       const resp = await api<SpecResponse>('/api/specs', fabric, {
@@ -165,7 +165,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           sourceLakehouseId: sourceId,
           tables: Array.from(selectedTables),
           targetLakehouseName: targetName || null,
-          specMarkdown: specDraft || null
+          specMarkdown: specDraft || null,
+          existingRunId: run?.runId ?? null,
         })
       })
       setSpecs(resp)
@@ -234,7 +235,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         </MessageBar>
       )}
 
-      {effectivelySignedIn && !run && (
+      {effectivelySignedIn && (
         <Card>
           <CardHeader header={<Title3>1. Pick source &amp; tables</Title3>} />
           <div className={s.row}>
@@ -263,7 +264,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               </div>
               <div className={s.row}>
                 <Label htmlFor="tn">Target Lakehouse name (optional)</Label>
-                <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(auto-generated)" />
+                <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(auto-generated)" disabled={!!run} />
               </div>
               {!specDraft ? (
                 <div className={s.row}>
@@ -274,7 +275,11 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                 </div>
               ) : (
                 <>
-                  <Label htmlFor="spec">Spec (editable) {previewRunId && <Caption1>· run {previewRunId}</Caption1>}</Label>
+                  <Label htmlFor="spec">
+                    Spec (editable)
+                    {previewRunId && <Caption1>· run {previewRunId}</Caption1>}
+                    {run && <Caption1>· current run {run.runId}</Caption1>}
+                  </Label>
                   <Textarea
                     id="spec"
                     value={specDraft}
@@ -285,11 +290,13 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                   />
                   <div className={s.row}>
                     <Button appearance="primary" disabled={busy} onClick={generateSpecs}>
-                      Push to GitHub
+                      {run ? 'Update spec on GitHub' : 'Push to GitHub'}
                     </Button>
-                    <Button disabled={busy} onClick={() => { setSpecDraft(''); setPreviewRunId(null) }}>
-                      Regenerate from template
-                    </Button>
+                    {!run && (
+                      <Button disabled={busy} onClick={() => { setSpecDraft(''); setPreviewRunId(null) }}>
+                        Regenerate from template
+                      </Button>
+                    )}
                     {busy && <Spinner size="tiny" label={busyMsg} />}
                   </div>
                 </>
@@ -301,7 +308,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
       {run && (
         <Card>
-          <CardHeader header={<Title3>2. Review specs</Title3>} description={<Body1>Status: <strong>{run.status}</strong></Body1>} />
+          <CardHeader header={<Title3>2. Review &amp; build</Title3>} description={<Body1>Status: <strong>{run.status}</strong></Body1>} />
           <div className={s.status}>
             <div>Run ID: <code>{run.runId}</code></div>
             <div>Target Lakehouse: <code>{run.targetLakehouseName}</code></div>
@@ -312,15 +319,17 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
             {run.targetLakehouseId && <div>Created Lakehouse: <code>{run.targetLakehouseId}</code></div>}
             {run.jobInstanceId && <div>Notebook Job: <code>{run.jobInstanceId}</code></div>}
           </div>
-          {run.status === 'SpecsReady' && (
+          {['SpecsReady','Succeeded','Failed','Cancelled'].includes(run.status) && (
             <div className={s.row}>
-              <Button appearance="primary" disabled={busy} onClick={continueBuild}>Continue — build it</Button>
+              <Button appearance="primary" disabled={busy} onClick={continueBuild}>
+                {run.targetLakehouseId ? 'Re-build with updated spec' : 'Continue — build it'}
+              </Button>
               {busy && <Spinner size="tiny" label={busyMsg} />}
             </div>
           )}
           {run.status === 'Succeeded' && (
             <MessageBar intent="success">
-              <MessageBarBody><MessageBarTitle>Done</MessageBarTitle> Medallion built. Check the lakehouse in Fabric.</MessageBarBody>
+              <MessageBarBody><MessageBarTitle>Done</MessageBarTitle> Medallion built. Edit the spec above and press <b>Re-build with updated spec</b> to iterate — same lakehouse + notebook get updated in place.</MessageBarBody>
             </MessageBar>
           )}
           {(run.status === 'Failed' || run.status === 'Cancelled') && (
@@ -328,7 +337,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               <MessageBarBody><MessageBarTitle>{run.status}</MessageBarTitle> {run.message ?? ''}</MessageBarBody>
             </MessageBar>
           )}
-          {['Queued','GeneratingNotebook','CreatingLakehouse','DeployingNotebook','RunningNotebook','Building'].includes(run.status) && (
+          {['Queued','GeneratingNotebook','CreatingLakehouse','ReusingLakehouse','DeployingNotebook','UpdatingNotebook','RunningNotebook','Building'].includes(run.status) && (
             <Spinner label={`Building... (${run.status})`} />
           )}
         </Card>

@@ -80,10 +80,13 @@ public static class ApiEndpoints
             var src = lakes.FirstOrDefault(l => l.Id == body.SourceLakehouseId);
             if (src is null) return Results.NotFound("source lakehouse not in workspace");
 
-            var runId = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("n").Substring(0,6)}";
-            var targetName = string.IsNullOrWhiteSpace(body.TargetLakehouseName)
-                ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
-                : body.TargetLakehouseName!;
+            // If reusing an existing run, keep its id + target name + branch.
+            RunInfo? existing = string.IsNullOrEmpty(body.ExistingRunId) ? null : await store.GetAsync(body.ExistingRunId);
+            var runId = existing?.RunId ?? $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("n").Substring(0,6)}";
+            var targetName = existing?.TargetLakehouseName
+                ?? (string.IsNullOrWhiteSpace(body.TargetLakehouseName)
+                    ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
+                    : body.TargetLakehouseName!);
 
             var spec = string.IsNullOrWhiteSpace(body.SpecMarkdown)
                 ? gen.Generate(runId, src, body.Tables, targetName, ws)
@@ -91,14 +94,25 @@ public static class ApiEndpoints
 
             if (!gh.Configured)
             {
-                await store.CreateAsync(runId, "(local)", "(GITHUB_PAT not configured)",
-                                         ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
+                if (existing is null)
+                    await store.CreateAsync(runId, "(local)", "(GITHUB_PAT not configured)",
+                                             ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
                 return Results.Ok(new GenerateSpecsResponse(runId, "(local)", "(GITHUB_PAT not configured)", "(local)"));
             }
 
+            // PushSpecAsync now handles both create + update on the same branch.
             var (branch, blobUrl, rawUrl) = await gh.PushSpecAsync(runId, spec);
-            await store.CreateAsync(runId, branch, blobUrl,
-                                     ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
+
+            if (existing is null)
+            {
+                await store.CreateAsync(runId, branch, blobUrl,
+                                         ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
+            }
+            else
+            {
+                // Reset to a re-buildable state when re-pushing.
+                await store.UpdateStatusAsync(runId, "SpecsReady", null);
+            }
             return Results.Ok(new GenerateSpecsResponse(runId, branch, blobUrl, rawUrl));
         });
 
@@ -112,7 +126,6 @@ public static class ApiEndpoints
             var run = await store.GetAsync(body.RunId);
             if (run is null) return Results.NotFound();
 
-            // Use the workspace the run was created in (falls back to header or config).
             var ws = !string.IsNullOrWhiteSpace(run.WorkspaceId) ? run.WorkspaceId : fabric.ResolveWorkspaceId(Ws(req));
 
             await store.UpdateStatusAsync(run.RunId, "Queued");
@@ -122,9 +135,32 @@ public static class ApiEndpoints
             {
                 try
                 {
-                    await store.UpdateStatusAsync(run.RunId, "CreatingLakehouse");
-                    var lake = await fabric.CreateLakehouseAsync(tok, run.TargetLakehouseName!,
-                        $"Created by copilot.roesli.org for run {run.RunId}", ws);
+                    // Resolve target lakehouse — reuse existing if still there, else create.
+                    string targetLakehouseId;
+                    if (!string.IsNullOrEmpty(run.TargetLakehouseId))
+                    {
+                        var existing = await fabric.FindLakehouseByIdAsync(tok, run.TargetLakehouseId!, ws);
+                        if (existing is not null)
+                        {
+                            targetLakehouseId = existing.Id;
+                            bgLogger.LogInformation("Run {r}: reusing existing lakehouse {id}", run.RunId, existing.Id);
+                            await store.UpdateStatusAsync(run.RunId, "ReusingLakehouse");
+                        }
+                        else
+                        {
+                            await store.UpdateStatusAsync(run.RunId, "CreatingLakehouse");
+                            var lake = await fabric.CreateLakehouseAsync(tok, run.TargetLakehouseName!,
+                                $"Created by copilot.roesli.org for run {run.RunId}", ws);
+                            targetLakehouseId = lake.Id;
+                        }
+                    }
+                    else
+                    {
+                        await store.UpdateStatusAsync(run.RunId, "CreatingLakehouse");
+                        var lake = await fabric.CreateLakehouseAsync(tok, run.TargetLakehouseName!,
+                            $"Created by copilot.roesli.org for run {run.RunId}", ws);
+                        targetLakehouseId = lake.Id;
+                    }
 
                     await store.UpdateStatusAsync(run.RunId, "GeneratingNotebook");
                     var rawUrl = ToRawUrl(run.SpecUrl);
@@ -132,7 +168,7 @@ public static class ApiEndpoints
                     var tables = (run.TablesCsv ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
                     string nbContent;
                     var cells = spec is null ? null : await builder.GenerateCellsFromSpecAsync(
-                        spec, ws, run.SourceLakehouseId ?? "", lake.Id,
+                        spec, ws, run.SourceLakehouseId ?? "", targetLakehouseId,
                         run.TargetLakehouseName!, tables, run.RunId);
                     if (cells is not null && cells.Count > 0)
                     {
@@ -148,18 +184,52 @@ public static class ApiEndpoints
                             if (File.Exists(alt)) nbPath = alt;
                         }
                         nbContent = await File.ReadAllTextAsync(nbPath);
-                        bgLogger.LogInformation("Run {r}: using static fallback notebook", run.RunId);
                     }
 
-                    await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
-                    var notebookId = await fabric.CreateNotebookAsync(tok, $"medallion_builder_{run.RunId}", nbContent, ws);
+                    // Resolve notebook — update existing in place, else create.
+                    string notebookId;
+                    var nbName = $"medallion_builder_{run.RunId}";
+                    if (!string.IsNullOrEmpty(run.NotebookId))
+                    {
+                        await store.UpdateStatusAsync(run.RunId, "UpdatingNotebook");
+                        try
+                        {
+                            await fabric.UpdateNotebookDefinitionAsync(tok, run.NotebookId!, nbContent, ws);
+                            notebookId = run.NotebookId!;
+                            bgLogger.LogInformation("Run {r}: updated notebook {id} in place", run.RunId, notebookId);
+                        }
+                        catch (Exception updateEx)
+                        {
+                            // In-place update failed — rename the old one with _old suffix and create new.
+                            bgLogger.LogWarning(updateEx, "Update failed, falling back to recreate");
+                            try { await fabric.RenameItemAsync(tok, run.NotebookId!, $"{nbName}_old_{DateTime.UtcNow:HHmmss}", ws); } catch { }
+                            await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
+                            notebookId = await fabric.CreateNotebookAsync(tok, nbName, nbContent, ws);
+                        }
+                    }
+                    else
+                    {
+                        await store.UpdateStatusAsync(run.RunId, "DeployingNotebook");
+                        // If a notebook with this name already exists in the workspace (e.g. from a previous deploy
+                        // before we tracked the id), reuse its id.
+                        var existing = await fabric.FindNotebookIdAsync(tok, nbName, ws);
+                        if (existing is not null)
+                        {
+                            await fabric.UpdateNotebookDefinitionAsync(tok, existing, nbContent, ws);
+                            notebookId = existing;
+                        }
+                        else
+                        {
+                            notebookId = await fabric.CreateNotebookAsync(tok, nbName, nbContent, ws);
+                        }
+                    }
 
                     await store.UpdateStatusAsync(run.RunId, "RunningNotebook");
                     var parameters = new Dictionary<string, object>
                     {
                         ["source_lakehouse_id"] = new { value = run.SourceLakehouseId ?? "", type = "string" },
                         ["source_tables_csv"] = new { value = run.TablesCsv ?? "", type = "string" },
-                        ["target_lakehouse_id"] = new { value = lake.Id, type = "string" },
+                        ["target_lakehouse_id"] = new { value = targetLakehouseId, type = "string" },
                         ["target_lakehouse_name"] = new { value = run.TargetLakehouseName!, type = "string" },
                         ["workspace_id"] = new { value = ws, type = "string" },
                         ["run_id"] = new { value = run.RunId, type = "string" },
@@ -167,7 +237,7 @@ public static class ApiEndpoints
                     };
                     var instanceId = await fabric.RunNotebookAsync(tok, notebookId, parameters, ws);
 
-                    await store.UpdateBuildAsync(run.RunId, lake.Id, notebookId, instanceId);
+                    await store.UpdateBuildAsync(run.RunId, targetLakehouseId, notebookId, instanceId);
                     await store.UpdateStatusAsync(run.RunId, "Building", $"Notebook job {instanceId} started");
                 }
                 catch (Exception ex)

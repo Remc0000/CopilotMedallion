@@ -177,16 +177,107 @@ public class FabricService
             {
                 format = "ipynb",
                 parts = new[] {
-                    new {
-                        path = "notebook-content.ipynb",
-                        payload = ipynbB64,
-                        payloadType = "InlineBase64"
-                    }
+                    new { path = "notebook-content.ipynb", payload = ipynbB64, payloadType = "InlineBase64" }
                 }
             }
         };
         var resp = await c.PostAsync($"workspaces/{ws}/notebooks",
             new StringContent(JsonSerializer.Serialize(platformPayload), Encoding.UTF8, "application/json"));
+        return await ReadItemIdOrPollLroAsync(c, resp);
+    }
+
+    /// <summary>
+    /// Updates an existing notebook's definition in place. Returns when LRO completes.
+    /// </summary>
+    public async Task UpdateNotebookDefinitionAsync(string userToken, string notebookId, string ipynbContent, string? workspaceId = null)
+    {
+        var ws = ResolveWorkspaceId(workspaceId);
+        var c = Client(userToken);
+        var ipynbB64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(ipynbContent));
+        var payload = new
+        {
+            definition = new
+            {
+                format = "ipynb",
+                parts = new[] {
+                    new { path = "notebook-content.ipynb", payload = ipynbB64, payloadType = "InlineBase64" }
+                }
+            }
+        };
+        var resp = await c.PostAsync($"workspaces/{ws}/notebooks/{notebookId}/updateDefinition?updateMetadata=false",
+            new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
+        var raw = await resp.Content.ReadAsStringAsync();
+        if (!resp.IsSuccessStatusCode) throw new Exception($"UpdateNotebookDefinition failed {resp.StatusCode}: {raw}");
+        if (resp.StatusCode == System.Net.HttpStatusCode.Accepted)
+        {
+            var loc = resp.Headers.Location?.ToString();
+            for (int i = 0; i < 60; i++)
+            {
+                await Task.Delay(5000);
+                var st = await c.GetAsync(loc);
+                var sj = await st.Content.ReadAsStringAsync();
+                if (!st.IsSuccessStatusCode) continue;
+                using var sd = JsonDocument.Parse(sj);
+                var status = sd.RootElement.TryGetProperty("status", out var s) ? s.GetString() : null;
+                if (status == "Succeeded") return;
+                if (status == "Failed" || status == "Cancelled")
+                    throw new Exception($"UpdateNotebookDefinition {status}: {sj}");
+            }
+            throw new Exception("UpdateNotebookDefinition polling timed out.");
+        }
+    }
+
+    /// <summary>
+    /// Try to find a notebook by display name in the workspace. Returns null if not found.
+    /// </summary>
+    public async Task<string?> FindNotebookIdAsync(string userToken, string displayName, string? workspaceId = null)
+    {
+        var ws = ResolveWorkspaceId(workspaceId);
+        var c = Client(userToken);
+        var resp = await c.GetAsync($"workspaces/{ws}/notebooks");
+        if (!resp.IsSuccessStatusCode) return null;
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        if (doc.RootElement.TryGetProperty("value", out var arr))
+            foreach (var e in arr.EnumerateArray())
+                if (string.Equals(e.GetProperty("displayName").GetString(), displayName, StringComparison.OrdinalIgnoreCase))
+                    return e.GetProperty("id").GetString();
+        return null;
+    }
+
+    public async Task<LakehouseInfo?> FindLakehouseByIdAsync(string userToken, string lakehouseId, string? workspaceId = null)
+    {
+        var ws = ResolveWorkspaceId(workspaceId);
+        var c = Client(userToken);
+        var resp = await c.GetAsync($"workspaces/{ws}/lakehouses/{lakehouseId}");
+        if (!resp.IsSuccessStatusCode) return null;
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var e = doc.RootElement;
+        return new LakehouseInfo(e.GetProperty("id").GetString()!,
+                                 e.GetProperty("displayName").GetString()!,
+                                 ws,
+                                 e.TryGetProperty("description", out var d) ? d.GetString() : null);
+    }
+
+    /// <summary>
+    /// Renames a Fabric item via PATCH. Used to suffix `_old` to artifacts being replaced.
+    /// </summary>
+    public async Task RenameItemAsync(string userToken, string itemId, string newDisplayName, string? workspaceId = null)
+    {
+        var ws = ResolveWorkspaceId(workspaceId);
+        var c = Client(userToken);
+        var resp = await c.PatchAsync($"workspaces/{ws}/items/{itemId}",
+            new StringContent(JsonSerializer.Serialize(new { displayName = newDisplayName }), Encoding.UTF8, "application/json"));
+        if (!resp.IsSuccessStatusCode)
+        {
+            var raw = await resp.Content.ReadAsStringAsync();
+            throw new Exception($"RenameItem failed {resp.StatusCode}: {raw}");
+        }
+    }
+
+    private static async Task<string> ReadItemIdOrPollLroAsync(HttpClient c, HttpResponseMessage resp)
+    {
         var raw = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode) throw new Exception($"CreateNotebook failed {resp.StatusCode}: {raw}");
         if (resp.StatusCode == System.Net.HttpStatusCode.Accepted)
