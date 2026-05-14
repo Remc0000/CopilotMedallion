@@ -4,7 +4,14 @@ public record SourceTable(string Name, string Path);
 
 public record LakehouseInfo(string Id, string DisplayName, string WorkspaceId, string? Description);
 
-public record GenerateSpecsRequest(string SourceLakehouseId, List<string> Tables, string? TargetLakehouseName, string? SpecMarkdown, string? ExistingRunId);
+public record GenerateSpecsRequest(
+    string SourceLakehouseId,
+    List<string> Tables,
+    string? TargetLakehouseName,
+    string? SpecMarkdown,
+    string? ExistingRunId,
+    string? TargetLakehouseId,
+    string? TargetWorkspaceId);
 
 public record PreviewSpecsRequest(string SourceLakehouseId, List<string> Tables, string? TargetLakehouseName);
 
@@ -28,5 +35,6 @@ public record RunInfo(
     string? JobInstanceId,
     string? Message,
     DateTime CreatedAt,
-    DateTime UpdatedAt
+    DateTime UpdatedAt,
+    string? TargetWorkspaceId = null
 );

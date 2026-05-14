@@ -114,7 +114,8 @@ public static class ApiEndpoints
             {
                 if (existing is null)
                     await store.CreateAsync(runId, "(local)", "(GITHUB_PAT not configured)",
-                                             ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName, ItemId(req));
+                                             ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName, ItemId(req),
+                                             body.TargetLakehouseId, body.TargetWorkspaceId);
                 return Results.Ok(new GenerateSpecsResponse(runId, "(local)", "(GITHUB_PAT not configured)", "(local)"));
             }
 
@@ -123,7 +124,8 @@ public static class ApiEndpoints
             if (existing is null)
             {
                 await store.CreateAsync(runId, branch, blobUrl,
-                                         ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName, ItemId(req));
+                                         ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName, ItemId(req),
+                                         body.TargetLakehouseId, body.TargetWorkspaceId);
             }
             else
             {

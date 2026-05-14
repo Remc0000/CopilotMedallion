@@ -75,6 +75,8 @@ export async function api<T>(path: string, fabricToken: string, init?: RequestIn
   // The optional sourceWorkspaceId (Fabric picker) overrides the item workspace for source lookups.
   const sws = (typeof window !== 'undefined' && (window as any).__copilotMedallionSourceWs) as string | undefined
   if (sws) headers['X-Fabric-Source-Workspace-Id'] = sws
+  const tws = (typeof window !== 'undefined' && (window as any).__copilotMedallionTargetWs) as string | undefined
+  if (tws) headers['X-Fabric-Target-Workspace-Id'] = tws
   const res = await fetch(path, { ...init, headers })
   if (!res.ok) {
     const t = await res.text()

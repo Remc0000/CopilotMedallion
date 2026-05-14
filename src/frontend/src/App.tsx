@@ -69,8 +69,11 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
   const [sourceLakehouseName, setSourceLakehouseName] = useState<string | null>(null)
   const [sourceWorkspaceOverride, setSourceWorkspaceOverride] = useState<string | null>(null)
+  const [targetLakehouseId, setTargetLakehouseId] = useState<string | null>(null)
+  const [targetLakehouseName2, setTargetLakehouseName2] = useState<string | null>(null)
+  const [targetWorkspaceId, setTargetWorkspaceId] = useState<string | null>(null)
 
-  // Inside Fabric: receive source picker results from the workload host.
+  // Inside Fabric: receive picker results from the workload host.
   useEffect(() => {
     if (!inFabricRuntime) return
     function handler(ev: MessageEvent) {
@@ -83,6 +86,14 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         const tabs: string[] = Array.isArray(ev.data.tables) ? ev.data.tables : []
         setSelectedTables(new Set(tabs))
         setTables(tabs.map(t => ({ name: t })))
+      }
+      if (ev.data?.type === 'copilot-medallion-target-picked') {
+        const tw = ev.data.workspaceId || null
+        ;(window as any).__copilotMedallionTargetWs = tw
+        setTargetWorkspaceId(tw)
+        setTargetLakehouseId(ev.data.lakehouseId || null)
+        setTargetLakehouseName2(ev.data.lakehouseName || null)
+        if (ev.data.lakehouseName) setTargetName(ev.data.lakehouseName)
       }
       if (ev.data?.type === 'copilot-medallion-source-pick-error') {
         setError(`Picker failed: ${ev.data.message}`)
@@ -217,6 +228,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           sourceLakehouseId: sourceId,
           tables: Array.from(selectedTables),
           targetLakehouseName: targetName || null,
+          targetLakehouseId: targetLakehouseId || null,
+          targetWorkspaceId: targetWorkspaceId || null,
           specMarkdown: specDraft || null,
           existingRunId: run?.runId ?? null,
         })

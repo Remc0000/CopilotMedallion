@@ -7,7 +7,7 @@ public interface IRunStore
 {
     Task<RunInfo> CreateAsync(string runId, string branch, string specUrl,
                               string workspaceId, string sourceLakehouseId, string tablesCsv, string targetLakehouseName,
-                              string? itemId);
+                              string? itemId, string? targetLakehouseId, string? targetWorkspaceId);
     Task<RunInfo?> GetAsync(string runId);
     Task<RunInfo?> GetLatestByItemAsync(string itemId);
     Task UpdateStatusAsync(string runId, string status, string? message = null);
@@ -59,17 +59,23 @@ public class SqliteRunStore : IRunStore
             idx.CommandText = "CREATE INDEX IF NOT EXISTS ix_runs_item_id ON runs(item_id)";
             idx.ExecuteNonQuery();
         }
+        if (!existing.Contains("target_workspace_id"))
+        {
+            using var alter = c.CreateCommand();
+            alter.CommandText = "ALTER TABLE runs ADD COLUMN target_workspace_id TEXT";
+            alter.ExecuteNonQuery();
+        }
     }
 
     public async Task<RunInfo> CreateAsync(string runId, string branch, string specUrl,
                                             string workspaceId, string sourceLakehouseId, string tablesCsv, string targetLakehouseName,
-                                            string? itemId)
+                                            string? itemId, string? targetLakehouseId, string? targetWorkspaceId)
     {
         var now = DateTime.UtcNow.ToString("o");
         await using var c = new SqliteConnection(_connStr); await c.OpenAsync();
         var cmd = c.CreateCommand();
-        cmd.CommandText = @"INSERT INTO runs(run_id,status,branch,spec_url,workspace_id,source_lakehouse_id,tables_csv,target_lakehouse_name,item_id,created_at,updated_at)
-                            VALUES($id,'SpecsReady',$br,$su,$ws,$sl,$tc,$tl,$it,$ts,$ts)";
+        cmd.CommandText = @"INSERT INTO runs(run_id,status,branch,spec_url,workspace_id,source_lakehouse_id,tables_csv,target_lakehouse_name,item_id,target_lakehouse_id,target_workspace_id,created_at,updated_at)
+                            VALUES($id,'SpecsReady',$br,$su,$ws,$sl,$tc,$tl,$it,$tlid,$tws,$ts,$ts)";
         cmd.Parameters.AddWithValue("$id", runId);
         cmd.Parameters.AddWithValue("$br", branch);
         cmd.Parameters.AddWithValue("$su", specUrl);
@@ -78,6 +84,8 @@ public class SqliteRunStore : IRunStore
         cmd.Parameters.AddWithValue("$tc", tablesCsv);
         cmd.Parameters.AddWithValue("$tl", targetLakehouseName);
         cmd.Parameters.AddWithValue("$it", (object?)itemId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$tlid", (object?)targetLakehouseId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$tws", (object?)targetWorkspaceId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$ts", now);
         await cmd.ExecuteNonQueryAsync();
         return (await GetAsync(runId))!;
@@ -130,7 +138,7 @@ public class SqliteRunStore : IRunStore
 
     private const string SelectSql = @"SELECT run_id,status,branch,spec_url,workspace_id,source_lakehouse_id,tables_csv,
                                               target_lakehouse_id,target_lakehouse_name,notebook_id,job_instance_id,message,
-                                              created_at,updated_at FROM runs";
+                                              created_at,updated_at,target_workspace_id FROM runs";
 
     private static RunInfo Read(SqliteDataReader r)
     {
@@ -138,6 +146,6 @@ public class SqliteRunStore : IRunStore
         return new RunInfo(
             r.GetString(0), r.GetString(1), s(2), s(3), s(4), s(5), s(6),
             s(7), s(8), s(9), s(10), s(11),
-            DateTime.Parse(r.GetString(12)), DateTime.Parse(r.GetString(13)));
+            DateTime.Parse(r.GetString(12)), DateTime.Parse(r.GetString(13)), s(14));
     }
 }
