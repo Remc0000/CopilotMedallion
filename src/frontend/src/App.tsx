@@ -291,16 +291,15 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         <Card>
           <CardHeader header={<Title3>1. Pick source &amp; tables</Title3>} />
           {inFabricRuntime ? (
-            <div className={s.row}>
-              <Button appearance="primary" disabled={busy} onClick={pickSourceViaFabric}>
-                {sourceId ? 'Change source & tables…' : 'Pick source Lakehouse & tables…'}
-              </Button>
-              {sourceId && (
+            sourceId ? (
+              <div className={s.row}>
                 <Caption1>
-                  <code>{sourceLakehouseName ?? sourceId}</code> · {selectedTables.size} table{selectedTables.size === 1 ? '' : 's'}
+                  Source: <code>{sourceLakehouseName ?? sourceId}</code> · {selectedTables.size} table{selectedTables.size === 1 ? '' : 's'}
                 </Caption1>
-              )}
-            </div>
+              </div>
+            ) : (
+              <Body1>Use <b>Pick source Lakehouse & tables…</b> at the top to choose what to ingest.</Body1>
+            )
           ) : (
             <>
               <div className={s.row}>
