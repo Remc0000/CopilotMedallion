@@ -25,7 +25,14 @@ app.UseSwaggerUI();
 
 app.MapApiEndpoints();
 
-// SPA fallback - everything not matched and not an API path returns index.html
+// SPA fallback for the Fabric workload bundle hosted under /workload/*
+app.MapFallback("/workload/{*path}", ctx =>
+{
+    ctx.Response.ContentType = "text/html";
+    return ctx.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath, "workload", "index.html"));
+});
+
+// Default SPA fallback for the standalone app at /
 app.MapFallbackToFile("index.html");
 
 app.Run();
