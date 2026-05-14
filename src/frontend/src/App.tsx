@@ -359,47 +359,72 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               )}
             </>
           )}
-          {(sourceId && selectedTables.size > 0) && (
-            <>
-              <div className={s.row}>
-                <Label htmlFor="tn">Target Lakehouse name (optional)</Label>
-                <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(auto-generated)" disabled={!!run} />
-              </div>
-              {!specDraft ? (
-                <div className={s.row}>
-                  <Button appearance="primary" disabled={busy || selectedTables.size === 0} onClick={previewSpecs}>
-                    Preview spec
-                  </Button>
-                  {busy && <Spinner size="tiny" label={busyMsg} />}
-                </div>
-              ) : (
-                <>
-                  <Label htmlFor="spec">
-                    Spec (editable)
-                    {previewRunId && <Caption1>· run {previewRunId}</Caption1>}
-                    {run && <Caption1>· current run {run.runId}</Caption1>}
-                  </Label>
-                  <Textarea
-                    id="spec"
-                    value={specDraft}
-                    onChange={(_, d) => setSpecDraft(d.value)}
-                    rows={20}
-                    resize="vertical"
-                    style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }}
-                  />
-                  <div className={s.row}>
-                    <Button appearance="primary" disabled={busy} onClick={generateSpecs}>
-                      {run ? 'Update spec on GitHub' : 'Push to GitHub'}
-                    </Button>
-                    {!run && (
-                      <Button disabled={busy} onClick={() => { setSpecDraft(''); setPreviewRunId(null) }}>
-                        Regenerate from template
-                      </Button>
-                    )}
-                    {busy && <Spinner size="tiny" label={busyMsg} />}
-                  </div>
-                </>
+          {(sourceId && selectedTables.size > 0) && null}
+        </Card>
+      )}
+
+      {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
+        <Card>
+          <CardHeader header={<Title3>2. Choose target Lakehouse</Title3>} description={<Body1>Pick an existing Lakehouse via the top-bar <b>Pick target Lakehouse…</b> button, or just type a name below to create a fresh one.</Body1>} />
+          {targetLakehouseId ? (
+            <div className={s.row}>
+              <Caption1>
+                Using existing target: <code>{targetLakehouseName2 ?? targetLakehouseId}</code>
+                {targetWorkspaceId && targetWorkspaceId !== fabricWorkspaceId && <> · workspace <code>{targetWorkspaceId}</code></>}
+              </Caption1>
+              {!run && (
+                <Button disabled={busy} onClick={() => {
+                  setTargetLakehouseId(null); setTargetWorkspaceId(null); setTargetLakehouseName2(null)
+                  ;(window as any).__copilotMedallionTargetWs = null
+                  setTargetName('')
+                }}>Clear</Button>
               )}
+            </div>
+          ) : (
+            <div className={s.row}>
+              <Label htmlFor="tn">Target Lakehouse name (creates new)</Label>
+              <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(auto-generated)" disabled={!!run} />
+            </div>
+          )}
+        </Card>
+      )}
+
+      {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
+        <Card>
+          <CardHeader header={<Title3>3. Review &amp; build</Title3>} />
+          {!specDraft ? (
+            <div className={s.row}>
+              <Button appearance="primary" disabled={busy || selectedTables.size === 0} onClick={previewSpecs}>
+                Preview spec
+              </Button>
+              {busy && <Spinner size="tiny" label={busyMsg} />}
+            </div>
+          ) : (
+            <>
+              <Label htmlFor="spec">
+                Spec (editable)
+                {previewRunId && <Caption1>· run {previewRunId}</Caption1>}
+                {run && <Caption1>· current run {run.runId}</Caption1>}
+              </Label>
+              <Textarea
+                id="spec"
+                value={specDraft}
+                onChange={(_, d) => setSpecDraft(d.value)}
+                rows={20}
+                resize="vertical"
+                style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }}
+              />
+              <div className={s.row}>
+                <Button appearance="primary" disabled={busy} onClick={generateSpecs}>
+                  {run ? 'Update spec on GitHub' : 'Push to GitHub'}
+                </Button>
+                {!run && (
+                  <Button disabled={busy} onClick={() => { setSpecDraft(''); setPreviewRunId(null) }}>
+                    Regenerate from template
+                  </Button>
+                )}
+                {busy && <Spinner size="tiny" label={busyMsg} />}
+              </div>
             </>
           )}
         </Card>
@@ -407,7 +432,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
       {run && (
         <Card>
-          <CardHeader header={<Title3>2. Review &amp; build</Title3>} description={<Body1>Status: <strong>{run.status}</strong></Body1>} />
+          <CardHeader header={<Title3>Build status</Title3>} description={<Body1>Status: <strong>{run.status}</strong></Body1>} />
           <div className={s.status}>
             <div>Run ID: <code>{run.runId}</code></div>
             <div>Target Lakehouse: <code>{run.targetLakehouseName}</code></div>
