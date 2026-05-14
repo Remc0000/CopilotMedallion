@@ -172,7 +172,7 @@ public static class ApiEndpoints
                         run.TargetLakehouseName!, tables, run.RunId);
                     if (cells is not null && cells.Count > 0)
                     {
-                        nbContent = builder.BuildNotebookJson(cells);
+                        nbContent = builder.BuildNotebookJson(cells, targetLakehouseId, run.TargetLakehouseName, ws);
                         bgLogger.LogInformation("Run {r}: using LLM-generated notebook with {n} cells", run.RunId, cells.Count);
                     }
                     else

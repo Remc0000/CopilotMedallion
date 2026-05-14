@@ -41,31 +41,58 @@ public class NotebookBuilder
     {
         if (!_llm.Configured) return null;
 
-        var system = @"You are an expert Microsoft Fabric data engineer. You write PySpark notebook code that runs inside a Fabric notebook (synapse_pyspark kernel) to build a medallion architecture exactly as described in a user-provided spec.
+        var system = @"You are an expert Microsoft Fabric data engineer following the Microsoft Fabric e2e-medallion-architecture best practices. You generate PySpark notebook cells that run inside a Fabric notebook (synapse_pyspark kernel) and build a complete Bronze → Silver → Gold medallion implementation of the user's spec.
 
 OUTPUT FORMAT (STRICT):
-Return ONLY a JSON object with shape: {""cells"": [""<python source for cell 1>"", ""<python source for cell 2>"", ...]}
-No prose, no markdown fences, just the JSON.
+Return ONLY a JSON object: {""cells"": [""<python source for cell 1>"", ""<python source for cell 2>"", ...]}.
+No prose, no markdown fences — only the JSON.
 
-CODE REQUIREMENTS:
-- Each cell is one self-contained block of valid Python.
-- Use abfss paths to OneLake:
+PLATFORM CONSTRAINTS:
+- The first cell of the notebook will be provided by the platform with these variables ALREADY defined: workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv (comma-separated relative table paths under Tables/), run_id, spec_url. You MUST NOT redefine them — use them as-is.
+- Spark abfss paths:
     src_base = f""abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{source_lakehouse_id}""
     tgt_base = f""abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/{target_lakehouse_id}""
-- Source tables live at:  f""{src_base}/Tables/{table_relative_path}""
-  where table_relative_path is one of the provided strings (may contain '/').
-- Write Bronze tables to: f""{tgt_base}/Tables/bronze_<flat>""  (flat = table_relative_path.replace('/','_').lower())
-- Write Silver tables to: f""{tgt_base}/Tables/silver_<flat>""
-- Write Gold tables (dim_*/fact_*) to: f""{tgt_base}/Tables/<gold_name>""
-- Always use spark.read.format('delta').load(...) and DataFrame.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(...).
-- The FIRST cell will be supplied by the platform and defines these variables: workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url. DO NOT redefine them; use them.
-- Add a final cell that prints a JSON summary on one line: print(json.dumps({'run_id': run_id, 'status': 'ok', 'bronze': bronze_results, 'silver': silver_results, 'gold': gold_results}, default=str))
-- Wrap each major step (bronze loop, silver loop, gold) in try/except that logs to print() and re-raises only after collecting partial results.
-- Use the tables listed in source_tables_csv. Split on ','.
-- If the spec asks for AdventureWorksLT-shaped gold, look for tables whose last path-segment matches (case-insensitive) Customer, Product, SalesOrderHeader, SalesOrderDetail and build dim_customer, dim_product, dim_date, fact_sales accordingly.
-- Keep code defensive: trim strings, drop fully-null columns in Silver, add _silver_ts audit column.
-- NEVER use credentials or hardcoded secrets. Trust the notebook's runtime identity for OneLake access.
-- The total code should fit within reasonable bounds (~10 cells, ~150 lines).";
+- Source tables live at: f""{src_base}/Tables/{table_relative_path}"" where table_relative_path is one of the values in source_tables_csv (may contain '/').
+- Write Bronze tables to:  f""{tgt_base}/Tables/bronze_<flat>"" (flat = table_relative_path.replace('/','_').lower())
+- Write Silver tables to:  f""{tgt_base}/Tables/silver_<flat>""
+- Write Gold tables to:    f""{tgt_base}/Tables/<gold_name>"" (e.g. dim_customer, fact_sales)
+- Always use spark.read.format('delta').load(...) and DataFrame.write.format('delta')...save(...).
+- Never use credentials/secrets — trust the notebook runtime identity for OneLake access.
+- Output a single line of JSON to stdout at the end (see SUMMARY rule).
+
+MEDALLION RULES (apply ALL of these — they come from the official Microsoft Fabric e2e-medallion-architecture skill):
+
+Bronze (write-heavy, append):
+- For each table from source_tables_csv: read from src_base, add metadata columns ingestion_timestamp (current_timestamp), source_path (literal abfss source path), batch_id (literal run_id).
+- Write to target with mode='overwrite' (this is a re-buildable pipeline), option('overwriteSchema','true'), partitioned by ingestion_date when present, otherwise unpartitioned.
+- Track row counts in a dict bronze_results.
+
+Silver (balanced):
+- Read each bronze table, drop fully-null columns, trim string columns, deduplicate on natural key when discoverable (else dedupe by all columns), add _silver_ts audit column.
+- Use snake_case column names (rename CamelCase → snake_case).
+- Write with mode='overwrite' + overwriteSchema=true.
+- After write: spark.sql(f""OPTIMIZE delta.`{silver_path}`"") inside try/except.
+
+Gold (read-heavy, analytics-ready):
+- BEFORE any Gold write, set these Spark configs (required by the skill):
+    spark.conf.set('spark.sql.parquet.vorder.default','true')
+    spark.conf.set('spark.databricks.delta.optimizeWrite.enabled','true')
+    spark.conf.set('spark.databricks.delta.optimizeWrite.binSize','1g')
+- Detect AdventureWorksLT-shaped sources by checking last-segment names against {customer, product, salesorderheader, salesorderdetail}. If all four are present, build:
+    dim_customer (from silver_customer), dim_product (from silver_product), dim_date (distinct OrderDate with Year/Quarter/Month/Day), fact_sales (join SalesOrderDetail × SalesOrderHeader on SalesOrderID → CustomerKey/ProductKey/DateKey/Qty/UnitPrice/LineTotal).
+- Otherwise build sensible summary tables based on what the spec asks for (use your judgment from the spec markdown).
+- After each Gold write: try OPTIMIZE delta and ZORDER BY the most likely filter columns (date/key columns) inside try/except.
+- Track gold_results dict.
+
+Robustness:
+- Wrap each major step (bronze loop, silver loop, gold construction) in try/except. On exception, log via print() + traceback.format_exc(), then re-raise to fail the job.
+- Inside loops, per-table errors should be captured into the results dict as ""ERROR: ..."" but should not abort the entire layer.
+
+Final cell: print one line of JSON:
+    import json
+    print(json.dumps({'run_id': run_id, 'workspace_id': workspace_id, 'target_lakehouse_id': target_lakehouse_id, 'bronze': bronze_results, 'silver': silver_results, 'gold': gold_results}, default=str))
+
+Code size: aim for ~8–12 cells, ~200 lines total.";
 
         var user = $@"## Run parameters
 workspace_id = {workspaceId}
@@ -113,19 +140,20 @@ Produce the JSON now.";
 
     /// <summary>
     /// Build a complete .ipynb (JSON string) from a list of code cells.
-    /// Always prepends a "parameters" cell with the seven standard variables.
+    /// Always prepends a "parameters" cell with the seven standard variables and
+    /// binds the target lakehouse via `metadata.dependencies.lakehouse` so the
+    /// notebook can use Spark relative paths and SQL endpoint without manual binding.
     /// </summary>
-    public string BuildNotebookJson(List<string> codeCells)
+    public string BuildNotebookJson(List<string> codeCells, string? targetLakehouseId = null,
+                                     string? targetLakehouseName = null, string? workspaceId = null)
     {
         var cells = new List<object>();
-        // Markdown header
         cells.Add(new
         {
             cell_type = "markdown",
             metadata = new { },
-            source = new[] { "# Copilot Medallion (LLM-generated from spec)\n\nGenerated by copilot.roesli.org." }
+            source = new[] { "# Copilot Medallion (LLM-generated from spec)\n\nGenerated by copilot.roesli.org following the Microsoft Fabric e2e-medallion-architecture skill." }
         });
-        // Parameters cell (Fabric Job Scheduler injects values here)
         cells.Add(new
         {
             cell_type = "code",
@@ -143,7 +171,6 @@ Produce the JSON now.";
                 "spec_url = \"\"\n"
             }
         });
-        // Imports + base paths
         cells.Add(new
         {
             cell_type = "code",
@@ -161,7 +188,6 @@ Produce the JSON now.";
                 "print(f\"run_id={run_id} src_base={src_base} tgt_base={tgt_base} tables={source_tables}\")\n"
             }
         });
-        // Generated cells
         foreach (var src in codeCells)
         {
             cells.Add(new
@@ -173,15 +199,43 @@ Produce the JSON now.";
                 source = SplitLines(src)
             });
         }
-        var nb = new
+
+        // Notebook metadata. If we know the target lakehouse, bind it via
+        // dependencies.lakehouse so the notebook is opened/run with the right context.
+        object metadata;
+        if (!string.IsNullOrEmpty(targetLakehouseId) && !string.IsNullOrEmpty(workspaceId))
         {
-            cells,
+            metadata = new
+            {
+                kernelspec = new { display_name = "synapse_pyspark", language = "python", name = "synapse_pyspark" },
+                language_info = new { name = "python" },
+                microsoft = new { language = "python" },
+                dependencies = new
+                {
+                    lakehouse = new
+                    {
+                        default_lakehouse = targetLakehouseId,
+                        default_lakehouse_name = targetLakehouseName ?? "",
+                        default_lakehouse_workspace_id = workspaceId,
+                        known_lakehouses = new[] { new { id = targetLakehouseId } }
+                    }
+                }
+            };
+        }
+        else
+        {
             metadata = new
             {
                 kernelspec = new { display_name = "synapse_pyspark", language = "python", name = "synapse_pyspark" },
                 language_info = new { name = "python" },
                 microsoft = new { language = "python" }
-            },
+            };
+        }
+
+        var nb = new
+        {
+            cells,
+            metadata,
             nbformat = 4,
             nbformat_minor = 5
         };
