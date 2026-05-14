@@ -81,11 +81,27 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         const sw = ev.data.workspaceId || null
         setSourceWorkspaceOverride(sw)
         ;(window as any).__copilotMedallionSourceWs = sw
-        setSourceId(ev.data.lakehouseId || null)
+        const lhId = ev.data.lakehouseId || null
+        setSourceId(lhId)
         setSourceLakehouseName(ev.data.lakehouseName || null)
         const tabs: string[] = Array.isArray(ev.data.tables) ? ev.data.tables : []
-        setSelectedTables(new Set(tabs))
-        setTables(tabs.map(t => ({ name: t })))
+        if (tabs.length === 0 && ev.data.onlyRoot && lhId) {
+          // User picked the root "Tables" node — enumerate all tables in that lakehouse via backend.
+          setBusy(true); setBusyMsg('Enumerating tables in source lakehouse...')
+          ensureToken().then(({ fabric }) =>
+            api<Table[]>(`/api/sources/lakehouses/${lhId}/tables`, fabric)
+              .then(list => {
+                const names = list.map(t => t.name)
+                setTables(list)
+                setSelectedTables(new Set(names))
+              })
+              .catch(e => setError(String(e)))
+              .finally(() => { setBusy(false); setBusyMsg('') })
+          )
+        } else {
+          setSelectedTables(new Set(tabs))
+          setTables(tabs.map(t => ({ name: t })))
+        }
       }
       if (ev.data?.type === 'copilot-medallion-target-picked') {
         const tw = ev.data.workspaceId || null
