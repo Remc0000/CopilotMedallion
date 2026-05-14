@@ -28,6 +28,10 @@ public static class ApiEndpoints
             var v = req.Headers[WorkspaceHeader].ToString();
             return string.IsNullOrWhiteSpace(v) ? null : v;
         }
+        static string? SrcWs(HttpRequest req) {
+            var v = req.Headers["X-Fabric-Source-Workspace-Id"].ToString();
+            return string.IsNullOrWhiteSpace(v) ? null : v;
+        }
         static string? ItemId(HttpRequest req) {
             var v = req.Headers["X-Fabric-Item-Id"].ToString();
             return string.IsNullOrWhiteSpace(v) ? null : v;
@@ -62,9 +66,17 @@ public static class ApiEndpoints
             var tok = req.Headers["X-Fabric-Token"].ToString();
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
             var ws = fabric.ResolveWorkspaceId(Ws(req));
-            var lakes = await fabric.ListLakehousesAsync(tok, ws);
+            var srcWs = SrcWs(req) ?? ws;
+            // The source can live in a different workspace than the item; use the override when set.
+            var lakes = await fabric.ListLakehousesAsync(tok, srcWs);
             var src = lakes.FirstOrDefault(l => l.Id == body.SourceLakehouseId);
-            if (src is null) return Results.NotFound("source lakehouse not in workspace");
+            // Fabric picker may return a lakehouse the listing API doesn't enumerate (e.g. cross-workspace
+            // schema-enabled). Fall back to a direct GET.
+            if (src is null)
+            {
+                src = await fabric.FindLakehouseByIdAsync(tok, body.SourceLakehouseId, srcWs);
+            }
+            if (src is null) return Results.NotFound("source lakehouse not accessible");
             var runId = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("n").Substring(0,6)}";
             var targetName = string.IsNullOrWhiteSpace(body.TargetLakehouseName)
                 ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
@@ -80,9 +92,11 @@ public static class ApiEndpoints
             if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
 
             var ws = fabric.ResolveWorkspaceId(Ws(req));
-            var lakes = await fabric.ListLakehousesAsync(tok, ws);
-            var src = lakes.FirstOrDefault(l => l.Id == body.SourceLakehouseId);
-            if (src is null) return Results.NotFound("source lakehouse not in workspace");
+            var srcWs = SrcWs(req) ?? ws;
+            var lakes = await fabric.ListLakehousesAsync(tok, srcWs);
+            var src = lakes.FirstOrDefault(l => l.Id == body.SourceLakehouseId)
+                      ?? await fabric.FindLakehouseByIdAsync(tok, body.SourceLakehouseId, srcWs);
+            if (src is null) return Results.NotFound("source lakehouse not accessible");
 
             // If reusing an existing run, keep its id + target name + branch.
             RunInfo? existing = string.IsNullOrEmpty(body.ExistingRunId) ? null : await store.GetAsync(body.ExistingRunId);

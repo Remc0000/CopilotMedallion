@@ -72,6 +72,9 @@ export async function api<T>(path: string, fabricToken: string, init?: RequestIn
   if (onelakeToken) headers['X-Onelake-Token'] = onelakeToken
   if (fabricWorkspaceId) headers['X-Fabric-Workspace-Id'] = fabricWorkspaceId
   if (fabricItemId) headers['X-Fabric-Item-Id'] = fabricItemId
+  // The optional sourceWorkspaceId (Fabric picker) overrides the item workspace for source lookups.
+  const sws = (typeof window !== 'undefined' && (window as any).__copilotMedallionSourceWs) as string | undefined
+  if (sws) headers['X-Fabric-Source-Workspace-Id'] = sws
   const res = await fetch(path, { ...init, headers })
   if (!res.ok) {
     const t = await res.text()

@@ -67,7 +67,34 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     return () => { cancelled = true }
   }, [inFabricRuntime])
 
-  // When a Fabric item is open: try to restore the latest run for that item.
+  const [sourceLakehouseName, setSourceLakehouseName] = useState<string | null>(null)
+  const [sourceWorkspaceOverride, setSourceWorkspaceOverride] = useState<string | null>(null)
+
+  // Inside Fabric: receive source picker results from the workload host.
+  useEffect(() => {
+    if (!inFabricRuntime) return
+    function handler(ev: MessageEvent) {
+      if (ev.data?.type === 'copilot-medallion-source-picked') {
+        const sw = ev.data.workspaceId || null
+        setSourceWorkspaceOverride(sw)
+        ;(window as any).__copilotMedallionSourceWs = sw
+        setSourceId(ev.data.lakehouseId || null)
+        setSourceLakehouseName(ev.data.lakehouseName || null)
+        const tabs: string[] = Array.isArray(ev.data.tables) ? ev.data.tables : []
+        setSelectedTables(new Set(tabs))
+        setTables(tabs.map(t => ({ name: t })))
+      }
+      if (ev.data?.type === 'copilot-medallion-source-pick-error') {
+        setError(`Picker failed: ${ev.data.message}`)
+      }
+    }
+    window.addEventListener('message', handler)
+    return () => window.removeEventListener('message', handler)
+  }, [inFabricRuntime])
+
+  function pickSourceViaFabric() {
+    window.parent?.postMessage({ type: 'copilot-medallion-pick-source' }, '*')
+  }
   useEffect(() => {
     if (!effectivelySignedIn || !fabricItemId || run) return
     ;(async () => {
@@ -128,6 +155,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   }
 
   useEffect(() => {
+    // Inside Fabric, tables come from the Fabric native picker (postMessage); skip backend fetch.
+    if (inFabricRuntime) return
     if (!sourceId || !token) return
     setBusy(true); setBusyMsg('Loading tables...')
     setSelectedTables(new Set())
@@ -141,7 +170,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         setBusy(false); setBusyMsg('')
       }
     })()
-  }, [sourceId, token])
+  }, [sourceId, token, inFabricRuntime])
 
   useEffect(() => {
     if (!run) return
@@ -261,30 +290,49 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       {effectivelySignedIn && (
         <Card>
           <CardHeader header={<Title3>1. Pick source &amp; tables</Title3>} />
-          <div className={s.row}>
-            <Label htmlFor="lh">Source Lakehouse</Label>
-            <Dropdown id="lh" placeholder="Select..." onOptionSelect={(_, d) => setSourceId(d.optionValue ?? null)} value={lakes.find(l => l.id === sourceId)?.displayName ?? ''}>
-              {lakes.map(l => <Option key={l.id} value={l.id} text={l.displayName}>{l.displayName}</Option>)}
-            </Dropdown>
-          </div>
-          {tables.length > 0 && (
+          {inFabricRuntime ? (
+            <div className={s.row}>
+              <Button appearance="primary" disabled={busy} onClick={pickSourceViaFabric}>
+                {sourceId ? 'Change source & tables…' : 'Pick source Lakehouse & tables…'}
+              </Button>
+              {sourceId && (
+                <Caption1>
+                  <code>{sourceLakehouseName ?? sourceId}</code> · {selectedTables.size} table{selectedTables.size === 1 ? '' : 's'}
+                </Caption1>
+              )}
+            </div>
+          ) : (
             <>
-              <Label>Tables to load to Bronze ({selectedTables.size} selected)</Label>
-              <div className={s.tables}>
-                {tables.map(t => (
-                  <div key={t.name}>
-                    <Checkbox
-                      checked={selectedTables.has(t.name)}
-                      onChange={(_, d) => {
-                        const next = new Set(selectedTables)
-                        if (d.checked) next.add(t.name); else next.delete(t.name)
-                        setSelectedTables(next)
-                      }}
-                      label={t.name}
-                    />
-                  </div>
-                ))}
+              <div className={s.row}>
+                <Label htmlFor="lh">Source Lakehouse</Label>
+                <Dropdown id="lh" placeholder="Select..." onOptionSelect={(_, d) => setSourceId(d.optionValue ?? null)} value={lakes.find(l => l.id === sourceId)?.displayName ?? ''}>
+                  {lakes.map(l => <Option key={l.id} value={l.id} text={l.displayName}>{l.displayName}</Option>)}
+                </Dropdown>
               </div>
+              {tables.length > 0 && (
+                <>
+                  <Label>Tables to load to Bronze ({selectedTables.size} selected)</Label>
+                  <div className={s.tables}>
+                    {tables.map(t => (
+                      <div key={t.name}>
+                        <Checkbox
+                          checked={selectedTables.has(t.name)}
+                          onChange={(_, d) => {
+                            const next = new Set(selectedTables)
+                            if (d.checked) next.add(t.name); else next.delete(t.name)
+                            setSelectedTables(next)
+                          }}
+                          label={t.name}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+          {(sourceId && selectedTables.size > 0) && (
+            <>
               <div className={s.row}>
                 <Label htmlFor="tn">Target Lakehouse name (optional)</Label>
                 <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(auto-generated)" disabled={!!run} />
