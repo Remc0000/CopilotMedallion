@@ -28,6 +28,10 @@ public static class ApiEndpoints
             var v = req.Headers[WorkspaceHeader].ToString();
             return string.IsNullOrWhiteSpace(v) ? null : v;
         }
+        static string? ItemId(HttpRequest req) {
+            var v = req.Headers["X-Fabric-Item-Id"].ToString();
+            return string.IsNullOrWhiteSpace(v) ? null : v;
+        }
 
         g.MapGet("/sources/lakehouses", async (HttpRequest req, FabricService fabric) =>
         {
@@ -96,24 +100,38 @@ public static class ApiEndpoints
             {
                 if (existing is null)
                     await store.CreateAsync(runId, "(local)", "(GITHUB_PAT not configured)",
-                                             ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
+                                             ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName, ItemId(req));
                 return Results.Ok(new GenerateSpecsResponse(runId, "(local)", "(GITHUB_PAT not configured)", "(local)"));
             }
 
-            // PushSpecAsync now handles both create + update on the same branch.
             var (branch, blobUrl, rawUrl) = await gh.PushSpecAsync(runId, spec);
 
             if (existing is null)
             {
                 await store.CreateAsync(runId, branch, blobUrl,
-                                         ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName);
+                                         ws, body.SourceLakehouseId, string.Join(",", body.Tables), targetName, ItemId(req));
             }
             else
             {
-                // Reset to a re-buildable state when re-pushing.
                 await store.UpdateStatusAsync(runId, "SpecsReady", null);
             }
             return Results.Ok(new GenerateSpecsResponse(runId, branch, blobUrl, rawUrl));
+        });
+
+        // Look up the latest run associated with a Fabric item, plus the spec markdown content.
+        g.MapGet("/runs/by-item/{itemId}", async (string itemId, IRunStore store, NotebookBuilder builder) =>
+        {
+            var run = await store.GetLatestByItemAsync(itemId);
+            if (run is null) return Results.NotFound();
+            // Fetch the spec markdown (best effort).
+            string? specMarkdown = null;
+            if (!string.IsNullOrWhiteSpace(run.SpecUrl) && run.SpecUrl.StartsWith("http"))
+            {
+                var raw = run.SpecUrl.Replace("https://github.com/", "https://raw.githubusercontent.com/")
+                                     .Replace("/blob/", "/");
+                specMarkdown = await builder.FetchSpecMarkdownAsync(raw);
+            }
+            return Results.Ok(new { run, specMarkdown });
         });
 
         g.MapPost("/build", async ([FromBody] BuildRequest body, HttpRequest req,

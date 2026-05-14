@@ -6,7 +6,7 @@ import {
   Checkbox, Link as FLink, Textarea
 } from '@fluentui/react-components'
 import { AppConfig, Lakehouse, Table, Run, SpecResponse } from './types'
-import { api, getFabricToken, getOnelakeToken, inFabric, fabricWorkspaceId } from './api'
+import { api, getFabricToken, getOnelakeToken, inFabric, fabricWorkspaceId, fabricItemId } from './api'
 
 const useStyles = makeStyles({
   shell: { maxWidth: '900px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' },
@@ -66,6 +66,29 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     })()
     return () => { cancelled = true }
   }, [inFabricRuntime])
+
+  // When a Fabric item is open: try to restore the latest run for that item.
+  useEffect(() => {
+    if (!effectivelySignedIn || !fabricItemId || run) return
+    ;(async () => {
+      try {
+        const { fabric } = await ensureToken()
+        const resp = await api<{ run: Run, specMarkdown: string | null }>(`/api/runs/by-item/${fabricItemId}`, fabric)
+        if (resp?.run) {
+          setRun(resp.run)
+          if (resp.run.sourceLakehouseId) setSourceId(resp.run.sourceLakehouseId)
+          if (resp.run.tablesCsv) setSelectedTables(new Set(resp.run.tablesCsv.split(',').filter(Boolean)))
+          if (resp.run.targetLakehouseName) setTargetName(resp.run.targetLakehouseName)
+          if (resp.specMarkdown) setSpecDraft(resp.specMarkdown)
+          setPreviewRunId(resp.run.runId)
+        }
+      } catch (e: any) {
+        // 404 means no run yet for this item — that's fine, normal first-time flow.
+        const msg = String(e ?? '')
+        if (!msg.includes('404')) console.warn('restore run failed', e)
+      }
+    })()
+  }, [effectivelySignedIn, fabricItemId])
 
   async function ensureToken() {
     const t = await getFabricToken(instance, appConfig.scope)

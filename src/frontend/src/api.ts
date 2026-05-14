@@ -5,6 +5,7 @@ let storageTokenFromHost: string | null = null
 
 export const inFabric = new URLSearchParams(window.location.search).get('inFabric') === '1'
 export const fabricWorkspaceId = new URLSearchParams(window.location.search).get('workspaceId')
+export const fabricItemId = new URLSearchParams(window.location.search).get('itemId')
 
 // When running inside a Fabric workload iframe, the outer page sends tokens via postMessage.
 // We send a "ready" once on load and on each request, since the outer side keeps the latest.
@@ -70,6 +71,7 @@ export async function api<T>(path: string, fabricToken: string, init?: RequestIn
   }
   if (onelakeToken) headers['X-Onelake-Token'] = onelakeToken
   if (fabricWorkspaceId) headers['X-Fabric-Workspace-Id'] = fabricWorkspaceId
+  if (fabricItemId) headers['X-Fabric-Item-Id'] = fabricItemId
   const res = await fetch(path, { ...init, headers })
   if (!res.ok) {
     const t = await res.text()
