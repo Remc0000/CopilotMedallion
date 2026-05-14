@@ -34,12 +34,33 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const [specs, setSpecs] = useState<SpecResponse | null>(null)
   const [run, setRun] = useState<Run | null>(null)
 
+  const inFabric = new URLSearchParams(window.location.search).get('inFabric') === '1'
+
   async function signIn() {
     setError(null)
     try {
-      await instance.loginPopup({ scopes: [appConfig.scope] })
+      if (inFabric) {
+        // Inside Fabric iframe: popups are blocked. Use redirect.
+        await instance.loginRedirect({ scopes: [appConfig.scope] })
+      } else {
+        await instance.loginPopup({ scopes: [appConfig.scope] })
+      }
     } catch (e: any) { setError(e.message ?? String(e)) }
   }
+
+  // When loaded inside Fabric, try silent SSO immediately so the user never sees a button.
+  useEffect(() => {
+    if (!inFabric || signedIn) return
+    ;(async () => {
+      try {
+        const res = await instance.ssoSilent({ scopes: [appConfig.scope] })
+        if (res && res.account) instance.setActiveAccount(res.account)
+      } catch {
+        // Fallback to redirect (still no popup; the iframe just redirects to login + back).
+        try { await instance.loginRedirect({ scopes: [appConfig.scope] }) } catch (e:any) { setError(String(e)) }
+      }
+    })()
+  }, [inFabric, signedIn])
 
   async function signOut() {
     sessionStorage.clear()
@@ -181,11 +202,15 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         {signedIn && <> · <FLink onClick={signOut} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>Sign out</FLink></>}
       </Caption1>
 
-      {!signedIn && (
+      {!signedIn && !inFabric && (
         <Card>
           <CardHeader header={<Title3>Sign in</Title3>} description={<Body1>Use your Entra account that has access to the Fabric workspace.</Body1>} />
           <Button appearance="primary" onClick={signIn}>Sign in with Microsoft</Button>
         </Card>
+      )}
+
+      {!signedIn && inFabric && (
+        <Spinner label="Signing in via Fabric..." />
       )}
 
       {error && (
