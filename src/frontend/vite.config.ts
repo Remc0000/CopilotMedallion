@@ -6,7 +6,9 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: path.resolve(__dirname, '../backend/CopilotMedallion.Api/wwwroot'),
-    emptyOutDir: true,
+    // IMPORTANT: don't wipe the entire wwwroot — it also holds /workload/ for the Fabric bundle.
+    // Vite will still overwrite its own outputs (index.html + assets/).
+    emptyOutDir: false,
   },
   server: {
     port: 5173,
