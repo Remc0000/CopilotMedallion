@@ -18,6 +18,22 @@ builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
 var app = builder.Build();
 
 app.UseCors();
+
+// Serve workload root paths explicitly (before static-file middleware) so the
+// workload SPA's index.html is returned for /workload and /workload/ without
+// colliding with the standalone app's SPA fallback below.
+app.Use(async (ctx, next) =>
+{
+    var p = ctx.Request.Path.Value;
+    if (p == "/workload" || p == "/workload/")
+    {
+        ctx.Response.ContentType = "text/html";
+        await ctx.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath, "workload", "index.html"));
+        return;
+    }
+    await next();
+});
+
 app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseSwagger();
@@ -25,14 +41,7 @@ app.UseSwaggerUI();
 
 app.MapApiEndpoints();
 
-// SPA fallback for the Fabric workload bundle hosted under /workload/*
-app.MapFallback("/workload/{*path}", ctx =>
-{
-    ctx.Response.ContentType = "text/html";
-    return ctx.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath, "workload", "index.html"));
-});
-
-// Default SPA fallback for the standalone app at /
+// SPA fallback for the standalone app
 app.MapFallbackToFile("index.html");
 
 app.Run();
