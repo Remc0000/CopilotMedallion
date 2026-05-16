@@ -16,6 +16,7 @@ public interface IRunStore
     Task UpdateSpecMarkdownAsync(string runId, string specMarkdown);
     Task SaveGuidanceSnapshotAsync(string runId, string content);
     Task<List<(int Id, DateTime CapturedAt, string RunId, string Content)>> ListGuidanceSnapshotsAsync(int limit);
+    Task<int> MarkAbandonedAsFailedAsync();
 }
 
 public class SqliteRunStore : IRunStore
@@ -194,6 +195,22 @@ public class SqliteRunStore : IRunStore
         cmd.Parameters.AddWithValue("$ts", DateTime.UtcNow.ToString("o"));
         cmd.Parameters.AddWithValue("$id", runId);
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task<int> MarkAbandonedAsFailedAsync()
+    {
+        // Anything in a non-terminal state at startup is an orphan from a previous process
+        // (App Service restart killed the in-memory orchestrator). Mark it Failed so the
+        // UI can surface it and auto-fix or manual re-build can pick up.
+        await using var c = new SqliteConnection(_connStr); await c.OpenAsync();
+        var cmd = c.CreateCommand();
+        cmd.CommandText = @"UPDATE runs
+            SET status='Failed',
+                message=COALESCE(message,'') || ' [auto-recovered: server restarted mid-build, click Re-build with updated spec to resume]',
+                updated_at=$ts
+            WHERE status NOT IN ('Succeeded','Failed','Cancelled','SpecsReady')";
+        cmd.Parameters.AddWithValue("$ts", DateTime.UtcNow.ToString("o"));
+        return await cmd.ExecuteNonQueryAsync();
     }
 
     public async Task SaveGuidanceSnapshotAsync(string runId, string content)

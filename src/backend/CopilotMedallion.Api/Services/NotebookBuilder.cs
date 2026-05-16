@@ -64,6 +64,15 @@ Return ONLY a JSON object with this exact shape:
 }
 No prose, no markdown fences — only the JSON. Each notebook is deployed and run sequentially.
 
+CELL COMMENTING (REQUIRED):
+- Every cell you emit MUST begin with a short comment block describing what the cell does and why. Format:
+    # ---
+    # <one-line summary of the cell>
+    # <optional 1-2 extra lines explaining intent, side effects, or assumptions>
+- Then the actual Python code follows. Skipping the comment block is not allowed for ANY cell, including small helper cells.
+- The comments should explain INTENT, not just repeat the code in prose.
+- Goal: someone scrolling through the notebook in Fabric can understand each block at a glance.
+
 NOTEBOOK INDEPENDENCE:
 - Each notebook receives the SAME parameter cell at the top (provided by the platform) with: workspace_id, source_workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url. DO NOT redefine these.
 - Each notebook receives a bootstrap cell that defines: src_base, tgt_base, source_tables, _save_error helper.
@@ -333,7 +342,16 @@ Apply these reference skills/agents at all times:
 - powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
 ```
 
-THEN include the standard cross-cutting code rules: defensive column references, alias-prefixed joins after every join, groupBy/agg column existence assertion, defensive REST handling with `if x is None: raise` BEFORE `.get()`, no `saveAsTable`, parameter cells, idempotent overwrite patterns, error-loud try/except that calls `_save_error(layer, e)` and re-raises.)
+THEN include the standard cross-cutting code rules: defensive column references, alias-prefixed joins after every join, groupBy/agg column existence assertion, defensive REST handling with `if x is None: raise` BEFORE `.get()`, no `saveAsTable`, parameter cells, idempotent overwrite patterns, error-loud try/except that calls `_save_error(layer, e)` and re-raises.
+
+ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
+```
+# ---
+# Read raw bronze table and apply schema enforcement.
+# Drops rows where any required key is null.
+df = spark.read.table(...)
+```
+Keep the comments human-readable, not the code repeated in prose. The goal: someone scrolling through the notebook in Fabric can understand each block at a glance.)
 
 ## Bronze
 (how each source table is landed into the `bronze` schema — metadata columns, write mode, partitioning. Be specific based on the picked tables.)

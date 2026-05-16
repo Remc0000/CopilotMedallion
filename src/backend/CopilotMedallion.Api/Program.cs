@@ -18,6 +18,16 @@ builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
 
 var app = builder.Build();
 
+// At startup, recover orphaned in-flight runs (from a previous process that was killed
+// mid-build by an App Service restart) so the UI doesn't show "Generating..." forever.
+try
+{
+    var store = app.Services.GetRequiredService<IRunStore>();
+    var n = await store.MarkAbandonedAsFailedAsync();
+    if (n > 0) app.Logger.LogWarning("Recovered {n} orphan run(s) on startup (marked Failed so they can be resumed)", n);
+}
+catch (Exception ex) { app.Logger.LogWarning(ex, "orphan-run recovery skipped"); }
+
 app.UseCors();
 
 // Prevent browsers from caching HTML entry points so deployed bundle-hash

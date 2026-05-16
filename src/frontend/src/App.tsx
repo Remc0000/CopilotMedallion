@@ -88,6 +88,7 @@ type BuildStep = {
   title: string
   sub?: string
   state: 'pending' | 'active' | 'done' | 'failed'
+  indent?: boolean
 }
 
 function openExternal(url: string) {
@@ -180,21 +181,21 @@ function statusToSteps(status: string, run: Run, model: string | null): BuildSte
     { key: 'lh', title: s === 'ReusingLakehouse' ? 'Reusing target Lakehouse' : 'Creating target Lakehouse',
       sub: run.targetLakehouseName ?? undefined,
       state: lakehouseState },
-    { key: 'gen', title: 'Generating 4 PySpark notebooks (bronze/silver/gold/reporting)',
-      sub: model ? `LLM: ${model}` : undefined,
+    { key: 'gen', title: 'Generating notebook cells with the LLM',
+      sub: model ? `Model: ${model} · one call produces cells for all 4 layers` : 'One LLM call produces cells for all 4 layers',
       state: genState },
-    { key: 'bronze', title: 'Bronze layer notebook',
+    { key: 'bronze', title: 'Bronze layer notebook (deploy + run)',
       sub: run.bronzeNotebookId ? `${lakehouseShortName}_bronze` : undefined,
-      state: layerState('bronze') },
-    { key: 'silver', title: 'Silver layer notebook',
+      state: layerState('bronze'), indent: true },
+    { key: 'silver', title: 'Silver layer notebook (deploy + run)',
       sub: run.silverNotebookId ? `${lakehouseShortName}_silver` : undefined,
-      state: layerState('silver') },
+      state: layerState('silver'), indent: true },
     { key: 'gold', title: 'Gold layer notebook (+ data quality tests)',
       sub: run.goldNotebookId ? `${lakehouseShortName}_gold` : undefined,
-      state: layerState('gold') },
+      state: layerState('gold'), indent: true },
     { key: 'reporting', title: 'Reporting notebook (semantic model + report + data agent)',
       sub: run.reportingNotebookId ? `${lakehouseShortName}_reporting` : undefined,
-      state: layerState('reporting') },
+      state: layerState('reporting'), indent: true },
     { key: 'done', title: 'Done',
       sub: succeeded ? 'All tables written; reports created' : undefined,
       state: succeeded ? 'done' : 'pending' }
@@ -879,7 +880,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         </a>
         <div className={s.headerTitle}>
           <Title1>🛠️ Copilot Medallion</Title1>
-          <Body1>Automated Bronze → Silver → Gold + semantic model + report + data agent for Microsoft Fabric.</Body1>
+          <Body1>Automated Bronze → Silver → Gold &amp; semantic model &amp; report &amp; data agent creator</Body1>
           <Caption1>
             {itemWorkspaceName ? <>Workspace: <strong>{itemWorkspaceName}</strong></> : (fabricWorkspaceId ? <>Workspace: <code>{fabricWorkspaceId}</code></> : null)}
             {signedIn && <> · <FLink onClick={signOut} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>Sign out</FLink></>}
@@ -1190,7 +1191,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                 st.state === 'active' ? '●' :
                 '○'
               return (
-                <div key={st.key} className={cls}>
+                <div key={st.key} className={cls} style={st.indent ? { marginLeft: 28, borderLeft: `2px solid ${tokens.colorNeutralStroke2}`, paddingLeft: 12 } : undefined}>
                   <div className={s.stepIcon}>
                     {st.state === 'active' ? <Spinner size="extra-tiny" /> : icon}
                   </div>
