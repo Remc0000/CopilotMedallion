@@ -164,7 +164,7 @@ public static class ApiEndpoints
 
             // First attempt: LLM-proposed spec tailored to the picked tables AND their actual schemas.
             string? md = null;
-            try { md = await builder.ProposeSpecAsync(runId, ws, src.DisplayName, src.Id, body.Tables, targetName, schemas); }
+            try { md = await builder.ProposeSpecAsync(runId, ws, src.DisplayName, src.Id, body.Tables, targetName, schemas, body.Model); }
             catch { /* fall back to template */ }
             // Fallback: static template if LLM unavailable or threw.
             if (string.IsNullOrWhiteSpace(md))

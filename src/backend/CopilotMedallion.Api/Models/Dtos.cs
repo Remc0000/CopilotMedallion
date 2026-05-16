@@ -13,7 +13,7 @@ public record GenerateSpecsRequest(
     string? TargetLakehouseId,
     string? TargetWorkspaceId);
 
-public record PreviewSpecsRequest(string SourceLakehouseId, List<string> Tables, string? TargetLakehouseName);
+public record PreviewSpecsRequest(string SourceLakehouseId, List<string> Tables, string? TargetLakehouseName, string? Model);
 
 public record PreviewSpecsResponse(string Markdown, string RunId, string TargetLakehouseName);
 

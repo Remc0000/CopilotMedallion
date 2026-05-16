@@ -493,7 +493,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           body: JSON.stringify({
             sourceLakehouseId: sourceId,
             tables: Array.from(selectedTables),
-            targetLakehouseName: targetName || null
+            targetLakehouseName: targetName || null,
+            model: selectedModel
           })
         }, onelake)
       setSpecDraft(resp.markdown)
