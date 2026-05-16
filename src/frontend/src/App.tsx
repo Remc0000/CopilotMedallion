@@ -584,9 +584,16 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     })
   }, [run?.runId])
 
+  // Tracks the latest auto-propose "intent" so an in-flight call whose inputs are no
+  // longer current can discard its result (e.g. user changed model dropdown mid-call).
+  const proposeIntentRef = useRef<string | null>(null)
+
   async function previewSpecs() {
     if (!sourceId || selectedTables.size === 0) return
-    setError(null); setBusy(true); setBusyMsg(`Reading source schemas and asking ${selectedModel ?? 'AI'} to propose a spec...`)
+    const intent = `${selectedModel}|${sourceId}|${[...selectedTables].sort().join(',')}`
+    proposeIntentRef.current = intent
+    const modelAtCall = selectedModel
+    setError(null); setBusy(true); setBusyMsg(`Reading source schemas and asking ${modelAtCall ?? 'AI'} to propose a spec...`)
     try {
       const { fabric, onelake } = await ensureToken()
       const resp = await api<{ markdown: string; runId: string; targetLakehouseName: string }>(
@@ -596,14 +603,25 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
             sourceLakehouseId: sourceId,
             tables: Array.from(selectedTables),
             targetLakehouseName: targetName || null,
-            model: selectedModel
+            model: modelAtCall
           })
         }, onelake)
+      // Stale-result guard: if the user changed the model/source/tables while this call
+      // was in flight, discard this response. The new effect tick will re-fire previewSpecs
+      // with the now-current selection.
+      if (proposeIntentRef.current !== intent) {
+        console.log('[previewSpecs] discarding stale result; current intent diverged from', intent)
+        return
+      }
       setSpecDraft(resp.markdown)
       setPreviewRunId(resp.runId)
       if (!targetName) setTargetName(resp.targetLakehouseName)
-    } catch (e: any) { setError(String(e)) }
-    finally { setBusy(false); setBusyMsg('') }
+    } catch (e: any) {
+      if (proposeIntentRef.current === intent) setError(String(e))
+    }
+    finally {
+      if (proposeIntentRef.current === intent) { setBusy(false); setBusyMsg('') }
+    }
   }
 
   // Auto-propose: as soon as the user has chosen a model + source + at least one table,
@@ -612,13 +630,14 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     if (!effectivelySignedIn) return
     if (!sourceId || selectedTables.size === 0) return
     if (!selectedModel) return
-    if (run || specDraft || busy) return
+    if (run || specDraft) return
     const key = `${selectedModel}|${sourceId}|${[...selectedTables].sort().join(',')}`
     if (autoProposedForKeyRef.current === key) return
+    // If an earlier auto-propose is still in flight with different inputs, mark our new
+    // intent so its result is discarded; then fire a fresh call. The new call's setBusy/
+    // setBusyMsg will overwrite the stale "asking gpt-5.4…" spinner.
     autoProposedForKeyRef.current = key
     previewSpecs().catch(e => console.warn('[auto-propose] failed', e))
-    // intentionally exclude `busy` from deps — we only want to fire on selection changes
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectivelySignedIn, sourceId, selectedTables, selectedModel, run, specDraft])
 
   async function saveAndBuild() {
