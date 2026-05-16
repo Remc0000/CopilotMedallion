@@ -14,6 +14,7 @@ const useStyles = makeStyles({
   headerBar: { display: 'flex', alignItems: 'center', gap: '14px', paddingBottom: '8px', borderBottom: `1px solid ${tokens.colorNeutralStroke2}`, marginBottom: '6px' },
   headerTitle: { flex: 1 },
   logo: { height: '168px', width: 'auto' },
+  logoLeft: { height: '120px', width: 'auto' },
   row: { display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' as const },
   status: { padding: '12px 16px', backgroundColor: tokens.colorNeutralBackground2, borderRadius: '6px', lineHeight: 1.7 },
   tables: { maxHeight: '260px', overflow: 'auto', padding: '8px 12px', border: `1px solid ${tokens.colorNeutralStroke2}`, borderRadius: '4px' },
@@ -747,6 +748,9 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   return (
     <div className={s.shell}>
       <div className={s.headerBar}>
+        <a href="#" onClick={(e) => e.preventDefault()} title="Copilot Medallion">
+          <img src="/logo.png" alt="Copilot Medallion" className={s.logoLeft} />
+        </a>
         <div className={s.headerTitle}>
           <Title1>🛠️ Copilot Medallion</Title1>
           <Body1>Automated Bronze → Silver → Gold + semantic model + report + data agent for Microsoft Fabric.</Body1>
@@ -757,7 +761,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           </Caption1>
         </div>
         <a href="https://github.com/Remc0000" target="_blank" rel="noreferrer" title="Remc0000 on GitHub">
-          <img src="/logo.png" alt="Remc0000" className={s.logo} />
+          <img src="/remc0000-wordmark.png" alt="Remc0000" className={s.logo} />
         </a>
       </div>
 
