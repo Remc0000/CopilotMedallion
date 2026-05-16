@@ -480,6 +480,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     }
   }
 
+  const autoProposedForKeyRef = useRef<string | null>(null)
+
   async function previewSpecs() {
     if (!sourceId || selectedTables.size === 0) return
     setError(null); setBusy(true); setBusyMsg(`Reading source schemas and asking ${selectedModel ?? 'AI'} to propose a spec...`)
@@ -501,9 +503,30 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     finally { setBusy(false); setBusyMsg('') }
   }
 
-  async function generateSpecs() {
+  // Auto-propose: as soon as the user has chosen a model + source + at least one table,
+  // call the LLM in the background and fill the spec editor. No "Propose Specs" click needed.
+  useEffect(() => {
+    if (!effectivelySignedIn) return
+    if (!sourceId || selectedTables.size === 0) return
+    if (!selectedModel) return
+    if (run || specDraft || busy) return
+    const key = `${selectedModel}|${sourceId}|${[...selectedTables].sort().join(',')}`
+    if (autoProposedForKeyRef.current === key) return
+    autoProposedForKeyRef.current = key
+    previewSpecs().catch(e => console.warn('[auto-propose] failed', e))
+    // intentionally exclude `busy` from deps — we only want to fire on selection changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effectivelySignedIn, sourceId, selectedTables, selectedModel, run, specDraft])
+
+  async function saveAndBuild() {
     if (!sourceId || selectedTables.size === 0) return
     setError(null); setBusy(true); setBusyMsg('Saving spec to lakehouse Files/spec.md…')
+    // Fresh build → reset iteration tracking so auto-fix gets a full budget.
+    setCurrentIteration(1)
+    triedAutoFixForKey.current.clear()
+    lastErrorSignatureRef.current = null
+    setStuckOnSameError(false)
+    setSparkError(null)
     try {
       const combined = recombineSpec()
       const { fabric } = await ensureToken()
@@ -520,7 +543,11 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         })
       })
       setSpecs(resp)
-      const r = await api<Run>(`/api/runs/${resp.runId}`, fabric)
+      setBusyMsg('Creating lakehouse + starting orchestrator notebook…')
+      const r = await api<Run>('/api/build', fabric, {
+        method: 'POST',
+        body: JSON.stringify({ runId: resp.runId, model: selectedModel })
+      })
       setRun(r)
     } catch (e: any) { setError(String(e)) }
     finally { setBusy(false); setBusyMsg('') }
@@ -755,7 +782,47 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
       {effectivelySignedIn && (
         <Card>
-          <CardHeader header={<Title3>1. Pick source &amp; tables</Title3>} />
+          <CardHeader
+            header={<Title3>1. Pick model</Title3>}
+            description={<Body1>Which LLM should propose specs and generate the notebooks?</Body1>}
+          />
+          <div className={s.row}>
+            <Label htmlFor="mdl-top">Notebook-generation model</Label>
+            <Dropdown
+              id="mdl-top"
+              value={selectedModel ?? ''}
+              selectedOptions={selectedModel ? [selectedModel] : []}
+              onOptionSelect={(_, d) => setSelectedModel(d.optionValue ?? null)}
+              disabled={!!run}
+            >
+              {availableModels.map(m => (
+                <Option key={m} value={m}>{m}</Option>
+              ))}
+            </Dropdown>
+          </div>
+          <div className={s.row}>
+            <Label htmlFor="iter-top">Max auto-fix iterations</Label>
+            <Input
+              id="iter-top"
+              type="number"
+              min={1}
+              max={20}
+              value={String(maxIterations)}
+              onChange={(_, d) => {
+                const n = parseInt(d.value || '5', 10)
+                if (!isNaN(n) && n >= 1 && n <= 20) setMaxIterations(n)
+              }}
+              style={{ width: 80 }}
+              disabled={!!run}
+            />
+            <Caption1>On failure, automatically ask the LLM to fix the spec and re-run, up to this many attempts.</Caption1>
+          </div>
+        </Card>
+      )}
+
+      {effectivelySignedIn && (
+        <Card>
+          <CardHeader header={<Title3>2. Pick source &amp; tables</Title3>} />
           {inFabricRuntime ? (
             sourceId ? (
               <div className={s.status}>
@@ -802,7 +869,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
       {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
         <Card>
-          <CardHeader header={<Title3>2. Choose target Lakehouse</Title3>} description={<Body1>Pick an existing Lakehouse via the top-bar <b>Pick target Lakehouse…</b> button, or just type a name below to create a fresh one.</Body1>} />
+          <CardHeader header={<Title3>3. Choose target Lakehouse</Title3>} description={<Body1>Pick an existing Lakehouse via the top-bar <b>Pick target Lakehouse…</b> button, or just type a name below to create a fresh one.</Body1>} />
           {targetLakehouseId ? (
             <div className={s.row}>
               <Caption1>
@@ -828,13 +895,10 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
       {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
         <Card>
-          <CardHeader header={<Title3>3. Review &amp; build</Title3>} />
+          <CardHeader header={<Title3>4. Review &amp; build</Title3>} />
           {!specDraft ? (
             <div className={s.row}>
-              <Button appearance="primary" disabled={busy || selectedTables.size === 0} onClick={previewSpecs}>
-                ✨ Propose Specs
-              </Button>
-              {busy && <Spinner size="tiny" label={busyMsg} />}
+              <Spinner size="tiny" label={busy ? busyMsg : `Asking ${selectedModel ?? 'AI'} to analyse your tables and propose a spec…`} />
             </div>
           ) : (
             <>
@@ -907,50 +971,18 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               })}
 
               {availableModels.length > 1 && (
-                <div className={s.row}>
-                  <Label htmlFor="mdl">Notebook-generation model</Label>
-                  <Dropdown
-                    id="mdl"
-                    value={selectedModel ?? ''}
-                    selectedOptions={selectedModel ? [selectedModel] : []}
-                    onOptionSelect={(_, d) => setSelectedModel(d.optionValue ?? null)}
-                  >
-                    {availableModels.map(m => (
-                      <Option key={m} value={m}>{m}</Option>
-                    ))}
-                  </Dropdown>
-                </div>
+                <Caption1>Model: <code>{selectedModel}</code> · change in section 1 if needed.</Caption1>
               )}
               <div className={s.row}>
-                <Label htmlFor="iter">Max auto-fix iterations</Label>
-                <Input
-                  id="iter"
-                  type="number"
-                  min={1}
-                  max={20}
-                  value={String(maxIterations)}
-                  onChange={(_, d) => {
-                    const n = parseInt(d.value || '5', 10)
-                    if (!isNaN(n) && n >= 1 && n <= 20) setMaxIterations(n)
-                  }}
-                  style={{ width: 80 }}
-                />
-                <Caption1>On failure, automatically ask the LLM to fix the spec and re-run, up to this many attempts.</Caption1>
-              </div>
-              <div className={s.row}>
-                <Button appearance="primary" disabled={busy} onClick={generateSpecs}>
-                  💾 Save spec
+                <Button appearance="primary" disabled={busy} onClick={saveAndBuild}>
+                  💾 Save Specs &amp; Build
                 </Button>
-                {!run && (
-                  <Button disabled={busy} onClick={() => { setSpecDraft(''); setPreviewRunId(null) }}>
-                    Regenerate from template
-                  </Button>
-                )}
                 {busy && <Spinner size="tiny" label={busyMsg} />}
               </div>
               <Caption1>
                 Saved into the target lakehouse at <code>Files/spec.md</code> (and tracked in the runs database).
                 {' '}A copy is also pushed to GitHub for history when <code>GITHUB_PAT</code> is configured.
+                {' '}Build starts immediately after save — no extra click needed.
               </Caption1>
             </>
           )}
@@ -960,7 +992,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       {run && (
         <Card>
           <CardHeader
-            header={<Title3>4. Build status</Title3>}
+            header={<Title3>5. Build status</Title3>}
             description={
               <Body1>
                 Status: <strong>{run.status}</strong>
