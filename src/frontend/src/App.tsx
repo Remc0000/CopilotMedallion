@@ -585,6 +585,22 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   }
 
   const autoProposedForKeyRef = useRef<string | null>(null)
+  const buildStatusRef = useRef<HTMLDivElement | null>(null)
+  const scrolledForRunRef = useRef<string | null>(null)
+
+  // Once a build run is created, smoothly scroll the build-status card into view.
+  // Only triggers once per runId so the user can scroll back up freely afterwards.
+  useEffect(() => {
+    if (!run?.runId) return
+    if (scrolledForRunRef.current === run.runId) return
+    if (!buildStatusRef.current) return
+    scrolledForRunRef.current = run.runId
+    // Defer to next frame so the card has actually rendered.
+    requestAnimationFrame(() => {
+      try { buildStatusRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
+      catch { /* old browsers */ }
+    })
+  }, [run?.runId])
 
   async function previewSpecs() {
     if (!sourceId || selectedTables.size === 0) return
@@ -1121,7 +1137,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       )}
 
       {run && (
-        <Card>
+        <Card ref={buildStatusRef}>
           <CardHeader
             header={<Title3>5. Build status</Title3>}
             description={(() => {
