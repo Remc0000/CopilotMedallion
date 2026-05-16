@@ -9,7 +9,7 @@ export interface AppConfig {
 export interface Lakehouse { id: string; displayName: string; workspaceId: string; description?: string }
 export interface Table { name: string; path?: string }
 
-export interface SpecResponse { runId: string; branch: string; specUrl: string; specRawUrl: string }
+export interface SpecResponse { runId: string; specUrl: string }
 
 export interface Run {
   runId: string

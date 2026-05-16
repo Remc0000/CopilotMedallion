@@ -561,9 +561,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     ;(async () => {
       try {
         const { fabric, onelake } = await ensureToken()
-        console.log('[sparkError] fetching error.txt, onelakeToken present=', !!onelake)
         const resp = await api<{ error: string | null }>(`/api/runs/${run.runId}/error`, fabric, undefined, onelake)
-        console.log('[sparkError] response error length=', resp.error?.length ?? 0)
         if (!cancelled && resp.error) setSparkError(resp.error)
       } catch (e) { console.warn('[sparkError] fetch failed', e) }
     })()
@@ -804,31 +802,13 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const effectiveErrorTrace = sparkError || (run?.message ?? null)
 
   useEffect(() => {
-    if (!run || !effectiveErrorTrace) {
-      console.log('[autoFix] skip: run=', !!run, 'errorTrace=', !!effectiveErrorTrace)
-      return
-    }
-    if (run.status !== 'Failed' && run.status !== 'Cancelled') {
-      console.log('[autoFix] skip: status=', run.status)
-      return
-    }
-    if (currentIteration >= maxIterations) {
-      console.log('[autoFix] skip: iterations exhausted', currentIteration, maxIterations)
-      return
-    }
-    if (autoFixing) {
-      console.log('[autoFix] skip: already auto-fixing')
-      return
-    }
-    if (stuckOnSameError) {
-      console.log('[autoFix] skip: stuck on same error')
-      return
-    }
+    if (!run || !effectiveErrorTrace) return
+    if (run.status !== 'Failed' && run.status !== 'Cancelled') return
+    if (currentIteration >= maxIterations) return
+    if (autoFixing) return
+    if (stuckOnSameError) return
     const key = `${run.runId}::iter${currentIteration}`
-    if (triedAutoFixForKey.current.has(key)) {
-      console.log('[autoFix] skip: already tried', key)
-      return
-    }
+    if (triedAutoFixForKey.current.has(key)) return
 
     const signature = signatureFromTrace(effectiveErrorTrace ?? '')
     if (lastErrorSignatureRef.current === signature) {
@@ -839,12 +819,10 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     // Only declare "stuck" after 3 consecutive identical signatures — gives the LLM
     // a few real chances even when its first fix attempt didn't move the needle.
     if (sameSignatureCountRef.current >= 3) {
-      console.log('[autoFix] STUCK: signature repeated', sameSignatureCountRef.current, 'times')
       setStuckOnSameError(true)
       return
     }
     lastErrorSignatureRef.current = signature
-    console.log('[autoFix] starting iteration', currentIteration + 1, 'of', maxIterations, 'signature-streak=', sameSignatureCountRef.current)
 
     setAutoFixing(true)
     setError(null); setBusy(true)
