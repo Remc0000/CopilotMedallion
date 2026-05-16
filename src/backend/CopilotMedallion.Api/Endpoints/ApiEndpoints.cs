@@ -1,4 +1,3 @@
-using System.Text.Json;
 using CopilotMedallion.Api.Models;
 using CopilotMedallion.Api.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -24,30 +23,28 @@ public static class ApiEndpoints
             runsRepo = $"{cfg["GitHub:Owner"]}/{cfg["GitHub:RunsRepo"]}"
         }));
 
-        static string? Ws(HttpRequest req) {
-            var v = req.Headers[WorkspaceHeader].ToString();
+        static string? Header(HttpRequest req, string name)
+        {
+            var v = req.Headers[name].ToString();
             return string.IsNullOrWhiteSpace(v) ? null : v;
         }
-        static string? SrcWs(HttpRequest req) {
-            var v = req.Headers["X-Fabric-Source-Workspace-Id"].ToString();
-            return string.IsNullOrWhiteSpace(v) ? null : v;
-        }
-        static string? ItemId(HttpRequest req) {
-            var v = req.Headers["X-Fabric-Item-Id"].ToString();
-            return string.IsNullOrWhiteSpace(v) ? null : v;
-        }
+        static string? FabricToken(HttpRequest req) => Header(req, "X-Fabric-Token");
+        static string? OneLakeToken(HttpRequest req) => Header(req, "X-Onelake-Token");
+        static string? Ws(HttpRequest req) => Header(req, WorkspaceHeader);
+        static string? SrcWs(HttpRequest req) => Header(req, "X-Fabric-Source-Workspace-Id");
+        static string? ItemId(HttpRequest req) => Header(req, "X-Fabric-Item-Id");
 
         g.MapGet("/sources/lakehouses", async (HttpRequest req, FabricService fabric) =>
         {
-            var tok = req.Headers["X-Fabric-Token"].ToString();
-            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
+            var tok = FabricToken(req);
+            if (tok is null) return Results.Unauthorized();
             return Results.Ok(await fabric.ListLakehousesAsync(tok, Ws(req)));
         });
 
         g.MapGet("/sources/lakehouses/{id}", async (string id, HttpRequest req, FabricService fabric) =>
         {
-            var tok = req.Headers["X-Fabric-Token"].ToString();
-            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
+            var tok = FabricToken(req);
+            if (tok is null) return Results.Unauthorized();
             var wsOverride = req.Query["workspaceId"].ToString();
             var ws = !string.IsNullOrWhiteSpace(wsOverride) ? wsOverride : (SrcWs(req) ?? Ws(req));
             var lh = await fabric.FindLakehouseByIdAsync(tok, id, ws);
@@ -60,8 +57,8 @@ public static class ApiEndpoints
 
         g.MapGet("/workspaces/{id}", async (string id, HttpRequest req, FabricService fabric, ILoggerFactory lf) =>
         {
-            var tok = req.Headers["X-Fabric-Token"].ToString();
-            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
+            var tok = FabricToken(req);
+            if (tok is null) return Results.Unauthorized();
             try
             {
                 var ws = await fabric.GetWorkspaceAsync(tok, id);
@@ -83,7 +80,7 @@ public static class ApiEndpoints
             var ws = !string.IsNullOrWhiteSpace(run.WorkspaceId) ? run.WorkspaceId! : fabric.ResolveWorkspaceId(Ws(req));
             var path = $"Files/_copilot_medallion/runs/{runId}/error.txt";
             // Try the user's OneLake token first (works for users with workspace access).
-            var userOnelakeTok = req.Headers["X-Onelake-Token"].ToString();
+            var userOnelakeTok = OneLakeToken(req);
             string? text = null;
             if (!string.IsNullOrEmpty(userOnelakeTok))
                 text = await fabric.TryDownloadTextFromLakehouseAsync(userOnelakeTok, ws, run.TargetLakehouseId!, path);
@@ -94,8 +91,8 @@ public static class ApiEndpoints
             return Results.Ok(new { error = text });
         });
 
-        g.MapPost("/runs/{runId}/fix-spec", async (string runId, [FromBody] FixSpecRequest body, HttpRequest req,
-                                                    IRunStore store, FabricService fabric, NotebookBuilder builder) =>
+        g.MapPost("/runs/{runId}/fix-spec", async (string runId, [FromBody] FixSpecRequest body,
+                                                    IRunStore store, NotebookBuilder builder) =>
         {
             var run = await store.GetAsync(runId);
             if (run is null) return Results.NotFound();
@@ -110,13 +107,13 @@ public static class ApiEndpoints
 
         g.MapGet("/sources/lakehouses/{id}/tables", async (string id, HttpRequest req, FabricService fabric) =>
         {
-            var tok = req.Headers["X-Fabric-Token"].ToString();
-            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
-            var onelakeTok = req.Headers["X-Onelake-Token"].ToString();
+            var tok = FabricToken(req);
+            if (tok is null) return Results.Unauthorized();
+            var onelakeTok = OneLakeToken(req);
             try
             {
                 return Results.Ok(await fabric.ListTablesAsync(tok, id,
-                    string.IsNullOrEmpty(onelakeTok) ? null : onelakeTok, SrcWs(req) ?? Ws(req)));
+                    onelakeTok, SrcWs(req) ?? Ws(req)));
             }
             catch (Exception ex)
             {
@@ -127,8 +124,8 @@ public static class ApiEndpoints
         g.MapPost("/specs/preview", async ([FromBody] PreviewSpecsRequest body, HttpRequest req,
                                             FabricService fabric, SpecGenerator gen, NotebookBuilder builder) =>
         {
-            var tok = req.Headers["X-Fabric-Token"].ToString();
-            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
+            var tok = FabricToken(req);
+            if (tok is null) return Results.Unauthorized();
             var ws = fabric.ResolveWorkspaceId(Ws(req));
             var srcWs = SrcWs(req) ?? ws;
             var lakes = await fabric.ListLakehousesAsync(tok, srcWs);
@@ -143,8 +140,8 @@ public static class ApiEndpoints
             // Introspect actual Delta schemas for the picked tables (up to 25, in parallel).
             // The LLM proposes based on the REAL columns/types — never assumes a known model.
             // Use the user's storage token (from X-Onelake-Token) so cross-workspace sources work.
-            var userOnelakeTok = req.Headers["X-Onelake-Token"].ToString();
-            var userTokForSchemas = string.IsNullOrEmpty(userOnelakeTok) ? null : userOnelakeTok;
+            var userOnelakeTok = OneLakeToken(req);
+            var userTokForSchemas = userOnelakeTok;
             var schemas = new Dictionary<string, string>();
             try
             {
@@ -177,8 +174,8 @@ public static class ApiEndpoints
         g.MapPost("/specs", async ([FromBody] GenerateSpecsRequest body, HttpRequest req,
                                     FabricService fabric, SpecGenerator gen, GitHubService gh, IRunStore store) =>
         {
-            var tok = req.Headers["X-Fabric-Token"].ToString();
-            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
+            var tok = FabricToken(req);
+            if (tok is null) return Results.Unauthorized();
 
             var ws = fabric.ResolveWorkspaceId(Ws(req));
             var srcWs = SrcWs(req) ?? ws;
@@ -270,11 +267,11 @@ public static class ApiEndpoints
         });
 
         g.MapPost("/build", async ([FromBody] BuildRequest body, HttpRequest req,
-                                     FabricService fabric, IRunStore store, IWebHostEnvironment env,
+                                     FabricService fabric, IRunStore store,
                                      NotebookBuilder builder, ILoggerFactory lf) =>
         {
-            var tok = req.Headers["X-Fabric-Token"].ToString();
-            if (string.IsNullOrEmpty(tok)) return Results.Unauthorized();
+            var tok = FabricToken(req);
+            if (tok is null) return Results.Unauthorized();
 
             var run = await store.GetAsync(body.RunId);
             if (run is null) return Results.NotFound();
@@ -505,8 +502,8 @@ public static class ApiEndpoints
             if (run is null) return Results.NotFound();
             if (run.Status == "Building" && run.NotebookId is not null && run.JobInstanceId is not null)
             {
-                var tok = req.Headers["X-Fabric-Token"].ToString();
-                if (!string.IsNullOrEmpty(tok))
+                var tok = FabricToken(req);
+                if (tok is not null)
                 {
                     var (st, fail) = await fabric.GetJobStatusAsync(tok, run.NotebookId, run.JobInstanceId, run.WorkspaceId);
                     if (st == "Completed") await store.UpdateStatusAsync(runId, "Succeeded");

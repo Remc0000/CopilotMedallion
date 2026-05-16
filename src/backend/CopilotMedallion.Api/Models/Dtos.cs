@@ -21,7 +21,6 @@ public record GenerateSpecsResponse(string RunId, string Branch, string SpecUrl,
 
 public record BuildRequest(string RunId, string? Model = null);
 public record FixSpecRequest(string CurrentSpec, string ErrorTrace, string? Model = null, int? Iteration = null, string? FailedLayer = null);
-public record ProposeSpecRequest(string SourceLakehouseId, string SourceLakehouseName, List<string> Tables, string? TargetLakehouseName, string? Model = null);
 
 public record RunInfo(
     string RunId,

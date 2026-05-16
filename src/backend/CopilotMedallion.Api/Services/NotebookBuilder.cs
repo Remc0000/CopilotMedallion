@@ -227,52 +227,32 @@ Produce the JSON now.";
         {
             using var doc = JsonDocument.Parse(json);
             var result = new Dictionary<string, List<string>>();
-            foreach (var layer in new[] { "bronze", "silver", "gold" })
+            foreach (var layer in new[] { "bronze", "silver", "gold", "reporting" })
             {
                 if (doc.RootElement.TryGetProperty(layer, out var arr) && arr.ValueKind == JsonValueKind.Array)
                 {
-                    var list = new List<string>();
-                    foreach (var c in arr.EnumerateArray())
-                        if (c.ValueKind == JsonValueKind.String) list.Add(c.GetString() ?? "");
+                    var list = ReadStringArray(arr);
                     if (list.Count > 0) result[layer] = list;
                 }
             }
             // Back-compat: if old "cells" array is present and no per-layer keys, return everything as gold (single notebook fallback).
             if (result.Count == 0 && doc.RootElement.TryGetProperty("cells", out var legacyArr))
             {
-                var list = new List<string>();
-                foreach (var c in legacyArr.EnumerateArray())
-                    if (c.ValueKind == JsonValueKind.String) list.Add(c.GetString() ?? "");
+                var list = ReadStringArray(legacyArr);
                 if (list.Count > 0) result["gold"] = list;
-            }
-            // Also accept the 4th key 'reporting' (above loop already handles bronze/silver/gold but not reporting).
-            if (doc.RootElement.TryGetProperty("reporting", out var rep) && rep.ValueKind == JsonValueKind.Array)
-            {
-                var list = new List<string>();
-                foreach (var c in rep.EnumerateArray())
-                    if (c.ValueKind == JsonValueKind.String) list.Add(c.GetString() ?? "");
-                if (list.Count > 0) result["reporting"] = list;
             }
             return result.Count == 0 ? null : result;
         }
         catch (Exception ex) { _log.LogWarning(ex, "LLM JSON parse failed"); return null; }
     }
 
-    public async Task<List<string>?> GenerateCellsFromSpecAsync(
-        string specMarkdown,
-        string workspaceId, string sourceLakehouseId, string targetLakehouseId,
-        string targetLakehouseName, List<string> sourceTables, string runId,
-        string? model = null)
+    private static List<string> ReadStringArray(JsonElement arr)
     {
-        var perLayer = await GenerateNotebooksFromSpecAsync(specMarkdown, workspaceId, sourceLakehouseId,
-            targetLakehouseId, targetLakehouseName, sourceTables, runId, model);
-        if (perLayer == null) return null;
-        var all = new List<string>();
-        foreach (var k in new[] { "bronze", "silver", "gold" })
-            if (perLayer.TryGetValue(k, out var cells)) all.AddRange(cells);
-        return all.Count == 0 ? null : all;
+        var list = new List<string>();
+        foreach (var c in arr.EnumerateArray())
+            if (c.ValueKind == JsonValueKind.String) list.Add(c.GetString() ?? "");
+        return list;
     }
-
 
     private static string? ExtractJson(string s)
     {
@@ -287,12 +267,6 @@ Produce the JSON now.";
         return null;
     }
 
-    /// <summary>
-    /// Given the previous spec markdown plus the Spark error traceback, ask the LLM to
-    /// produce an updated spec markdown that adds explicit constraints/clarifications
-    /// addressing the root cause of the failure. The structure of the spec is preserved
-    /// (same top-level headings) — only the content of the build instructions is tightened.
-    /// </summary>
     /// <summary>
     /// Generate an initial spec markdown tailored to the user's picked source tables.
     /// Returned markdown follows the canonical 5-section structure (Generic / Medallion /
