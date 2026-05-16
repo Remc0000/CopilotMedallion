@@ -19,6 +19,22 @@ var app = builder.Build();
 
 app.UseCors();
 
+// Prevent browsers from caching HTML entry points so deployed bundle-hash
+// changes are picked up on the next page load.
+app.Use(async (ctx, next) =>
+{
+    var p = ctx.Request.Path.Value ?? string.Empty;
+    var isHtmlEntry = p == "/" || p == "/workload" || p == "/workload/"
+        || p.EndsWith("/index.html", StringComparison.OrdinalIgnoreCase);
+    await next();
+    if (isHtmlEntry && ctx.Response.StatusCode == 200)
+    {
+        ctx.Response.Headers["Cache-Control"] = "no-cache, no-store, must-revalidate";
+        ctx.Response.Headers["Pragma"] = "no-cache";
+        ctx.Response.Headers["Expires"] = "0";
+    }
+});
+
 // Serve workload root paths explicitly (before static-file middleware) so the
 // workload SPA's index.html is returned for /workload and /workload/ without
 // colliding with the standalone app's SPA fallback below.
@@ -28,6 +44,7 @@ app.Use(async (ctx, next) =>
     if (p == "/workload" || p == "/workload/")
     {
         ctx.Response.ContentType = "text/html";
+        ctx.Response.Headers["Cache-Control"] = "no-cache, no-store, must-revalidate";
         await ctx.Response.SendFileAsync(Path.Combine(app.Environment.WebRootPath, "workload", "index.html"));
         return;
     }

@@ -13,7 +13,7 @@ const useStyles = makeStyles({
   shell: { maxWidth: '960px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column' as const, gap: '14px' },
   headerBar: { display: 'flex', alignItems: 'center', gap: '14px', paddingBottom: '8px', borderBottom: `1px solid ${tokens.colorNeutralStroke2}`, marginBottom: '6px' },
   headerTitle: { flex: 1 },
-  logo: { height: '112px', width: 'auto' },
+  logo: { height: '168px', width: 'auto' },
   row: { display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' as const },
   status: { padding: '12px 16px', backgroundColor: tokens.colorNeutralBackground2, borderRadius: '6px', lineHeight: 1.7 },
   tables: { maxHeight: '260px', overflow: 'auto', padding: '8px 12px', border: `1px solid ${tokens.colorNeutralStroke2}`, borderRadius: '4px' },
