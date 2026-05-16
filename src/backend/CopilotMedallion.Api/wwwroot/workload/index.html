@@ -1,1 +1,14 @@
-<html><head><title>Microsoft Fabric UX Sample Workload</title><script defer="defer" src="/workload/bundle.122eac6347688afae39c.js"></script></head><body style="margin:0"><div id="root"></div></body></html>
+<html><head><title>Microsoft Fabric UX Sample Workload</title><script>
+// Bridge: inner iframe (copilot.roesli.org) can ask us to open external URLs.
+// We live on the parent Fabric workload origin and are NOT sandboxed,
+// so window.open works here even when it is blocked inside the inner iframe.
+window.addEventListener('message', function (ev) {
+  try {
+    var d = ev && ev.data;
+    if (!d || d.type !== 'copilot-medallion-open-external' || !d.url) return;
+    if (typeof d.url !== 'string') return;
+    if (!/^https?:\/\//i.test(d.url)) return; // only http(s) allowed
+    window.open(d.url, '_blank', 'noopener,noreferrer');
+  } catch (e) { /* swallow */ }
+});
+</script><script defer="defer" src="/workload/bundle.122eac6347688afae39c.js"></script></head><body style="margin:0"><div id="root"></div></body></html>

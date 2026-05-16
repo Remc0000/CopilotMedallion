@@ -237,6 +237,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const lastErrorSignatureRef = useRef<string | null>(null)
   const sameSignatureCountRef = useRef<number>(0)
   const [stuckOnSameError, setStuckOnSameError] = useState(false)
+  const [autoFixRetryTick, setAutoFixRetryTick] = useState(0)
   const [nowTick, setNowTick] = useState(() => Date.now())
   const [usage, setUsage] = useState<{promptTokens:number; completionTokens:number; totalTokens:number; requests:number; estimatedCostUsd:number; perModel: {model:string; promptTokens:number; completionTokens:number; requests:number}[]} | null>(null)
   useEffect(() => {
@@ -825,16 +826,23 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     setError(null); setBusy(true)
     autoFixAndRebuild()
       .then(ok => {
-        // Only mark this iteration as "consumed" once it actually succeeded; if it threw
-        // (LLM hiccup, build call 5xx, etc.) leave the key out so the next tick can retry.
-        if (ok) triedAutoFixForKey.current.add(key)
+        // Only mark this iteration as "consumed" once it actually succeeded; if it returned
+        // false or threw, leave the key out so we can retry.
+        if (ok) {
+          triedAutoFixForKey.current.add(key)
+        } else {
+          // Returned false (e.g., recombineSpec was empty). Schedule a retry in 3s.
+          setTimeout(() => setAutoFixRetryTick(t => t + 1), 3000)
+        }
       })
       .catch(e => {
         console.error('[autoFix] failed', e)
-        setError(`Auto-fix failed (will retry): ${String(e)}`)
+        setError(`Auto-fix failed (will retry in 5s): ${String(e)}`)
+        // Schedule a retry so the loop is not permanently stuck on a transient error.
+        setTimeout(() => setAutoFixRetryTick(t => t + 1), 5000)
       })
       .finally(() => { setAutoFixing(false); setBusy(false); setBusyMsg('') })
-  }, [run?.runId, run?.status, sparkError, currentIteration, maxIterations, stuckOnSameError])
+  }, [run?.runId, run?.status, sparkError, currentIteration, maxIterations, stuckOnSameError, autoFixRetryTick])
 
   // Reset iteration counter whenever the user starts a fresh manual build.
   useEffect(() => {
@@ -1193,22 +1201,22 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               </MessageBar>
               <div className={s.row}>
                 {run.targetLakehouseId && run.workspaceId && (
-                  <Button appearance="primary" as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`) }}>
+                  <Button appearance="primary" as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`) }}>
                     Open Lakehouse
                   </Button>
                 )}
                 {run.bronzeNotebookId && run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`) }}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`) }}>
                     Open Bronze
                   </Button>
                 )}
                 {run.silverNotebookId && run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`) }}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`) }}>
                     Open Silver
                   </Button>
                 )}
                 {run.goldNotebookId && run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`) }}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`) }}>
                     Open Gold
                   </Button>
                 )}
@@ -1256,17 +1264,17 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                                 : run.currentLayer === 'bronze' ? run.bronzeNotebookId
                                 : (run.goldNotebookId ?? run.silverNotebookId ?? run.bronzeNotebookId)
                   return layerNb && run.workspaceId && (
-                    <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`) }}>
+                    <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`) }}>
                       Open failed {run.currentLayer ?? ''} notebook
                     </Button>
                   )
                 })()}
                 {run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`) }}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`) }}>
                     Open Workspace
                   </Button>
                 )}
-                <Button as="a" href={'https://app.fabric.microsoft.com/monitoringhub?experience=power-bi'} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal('https://app.fabric.microsoft.com/monitoringhub?experience=power-bi') }}>
+                <Button as="a" href={'https://app.fabric.microsoft.com/monitoringhub?experience=power-bi'} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal('https://app.fabric.microsoft.com/monitoringhub?experience=power-bi') }}>
                   Open Monitoring Hub
                 </Button>
               </div>
