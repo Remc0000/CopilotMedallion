@@ -443,6 +443,67 @@ Produce the updated spec markdown now. Remember to PREPEND a '## Updated specs' 
     }
 
     /// <summary>
+    /// User has just edited one section of the spec (e.g. Gold). Re-propose the
+    /// downstream sections that depend on it so the chain stays consistent.
+    /// Layer order: bronze → silver → gold → semantic → report → agent.
+    /// "generic" doesn't trigger downstream regen (it's cross-cutting guidance).
+    /// Returns the FULL updated spec markdown with downstream sections rewritten and
+    /// the user's edited section + everything upstream preserved verbatim.
+    /// </summary>
+    public async Task<string?> PropagateDownstreamAsync(string currentSpec, string editedSection, string? model = null, string? runId = null)
+    {
+        if (!_llm.Configured) return null;
+        var downstreamMap = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["bronze"]   = new[] { "Silver", "Gold", "Semantic model", "Report", "Data Agent" },
+            ["silver"]   = new[] { "Gold", "Semantic model", "Report", "Data Agent" },
+            ["gold"]     = new[] { "Semantic model", "Report", "Data Agent" },
+            ["semantic"] = new[] { "Report", "Data Agent" },
+            ["report"]   = new[] { "Data Agent" },
+            ["agent"]    = Array.Empty<string>(),
+            ["generic"]  = Array.Empty<string>(),
+        };
+        if (!downstreamMap.TryGetValue(editedSection, out var downstream) || downstream.Length == 0)
+        {
+            // No downstream to update — return the current spec unchanged.
+            return currentSpec;
+        }
+
+        var downstreamList = string.Join(", ", downstream.Select(s => "## " + s));
+        var system = $@"You are an expert Microsoft Fabric data architect maintaining the consistency of a multi-section build spec.
+
+The user has just edited one section. Your job is to re-propose ONLY the downstream sections so they remain consistent with the upstream edit.
+
+Edited section (upstream): ## {Capitalize(editedSection)}
+Downstream sections to re-propose: {downstreamList}
+
+STRICT RULES:
+1. Return ONLY the full updated spec markdown. No prose, no code fences wrapping the whole thing, no JSON.
+2. Preserve the existing top-level structure exactly: '# Run Spec ...', any '## Updated specs', '## Inputs', '## Generic guidance', '## Bronze', '## Silver', '## Gold', '## Semantic model', '## Report', '## Data Agent'.
+3. KEEP VERBATIM all sections at or upstream of the edited section ('## {Capitalize(editedSection)}' and everything above it). Do not modify Inputs, Generic guidance, or any upstream layer's content.
+4. REWRITE the downstream sections ({downstreamList}) so they are consistent with the edited section. Be specific: name columns, tables, measures based on what the upstream now says. Don't invent things not implied by the upstream content.
+5. Keep section ordering exactly the same.
+6. Do NOT add a '## Updated specs' changelog entry for this — that section is reserved for build-failure auto-fix.";
+
+        var user = $@"## Current full spec
+{currentSpec}
+
+The user just edited '## {Capitalize(editedSection)}'. Re-propose {downstreamList} to stay consistent. Return the entire updated spec markdown now.";
+
+        try
+        {
+            return await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.2, model: model, runId: runId);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "PropagateDownstream LLM call failed");
+            return null;
+        }
+    }
+
+    private static string Capitalize(string s) => string.IsNullOrEmpty(s) ? s : char.ToUpper(s[0]) + s.Substring(1);
+
+    /// <summary>
     /// Build a complete .ipynb (JSON string) from a list of code cells.
     /// Always prepends a "parameters" cell with the seven standard variables and
     /// binds the target lakehouse via `metadata.dependencies.lakehouse` so the

@@ -696,6 +696,25 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     finally { setBusy(false); setBusyMsg('') }
   }
 
+  // After the user edits a section, ask the LLM to revise downstream sections so the
+  // chain (Bronze → Silver → Gold → Semantic → Report → Data Agent) stays consistent.
+  async function propagateDownstream(editedSectionKey: string) {
+    if (!['bronze','silver','gold','semantic','report'].includes(editedSectionKey)) return
+    setError(null); setBusy(true)
+    const labelMap: Record<string,string> = { bronze: 'Silver/Gold/Semantic/Report/Data Agent', silver: 'Gold/Semantic/Report/Data Agent', gold: 'Semantic/Report/Data Agent', semantic: 'Report/Data Agent', report: 'Data Agent' }
+    setBusyMsg(`Asking ${selectedModel ?? 'AI'} to update ${labelMap[editedSectionKey] ?? 'downstream sections'}…`)
+    try {
+      const combined = recombineSpec()
+      const { fabric } = await ensureToken()
+      const r = await api<{ markdown: string }>('/api/specs/propagate', fabric, {
+        method: 'POST',
+        body: JSON.stringify({ currentSpec: combined, editedSection: editedSectionKey, model: selectedModel })
+      })
+      if (r.markdown) setSpecDraft(r.markdown)
+    } catch (e: any) { setError(`Propagate downstream failed: ${String(e)}`) }
+    finally { setBusy(false); setBusyMsg('') }
+  }
+
   async function fixSpec() {
     if (!run || !effectiveErrorTrace) return
     if (!specDraft) {
@@ -1107,6 +1126,19 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                           resize="vertical"
                           style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }}
                         />
+                        {['bronze','silver','gold','semantic','report'].includes(sec.key) && (
+                          <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <Button
+                              size="small"
+                              disabled={busy}
+                              onClick={() => propagateDownstream(sec.key)}
+                              icon={<span>🔄</span>}
+                            >
+                              Update downstream sections
+                            </Button>
+                            <Caption1>Re-runs the LLM to keep {sec.key === 'bronze' ? 'Silver/Gold/Semantic/Report/Data Agent' : sec.key === 'silver' ? 'Gold/Semantic/Report/Data Agent' : sec.key === 'gold' ? 'Semantic/Report/Data Agent' : sec.key === 'semantic' ? 'Report/Data Agent' : 'Data Agent'} consistent with your edits above.</Caption1>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

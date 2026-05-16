@@ -106,6 +106,18 @@ public static class ApiEndpoints
             return Results.Ok(new { markdown = updated });
         });
 
+        // The user edited one section of the spec (e.g. Gold). Re-propose the downstream
+        // sections so the chain stays consistent. Keeps upstream sections verbatim.
+        g.MapPost("/specs/propagate", async ([FromBody] PropagateSpecRequest body, NotebookBuilder builder) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.CurrentSpec) || string.IsNullOrWhiteSpace(body.EditedSection))
+                return Results.BadRequest(new { error = "currentSpec and editedSection are required" });
+            var updated = await builder.PropagateDownstreamAsync(body.CurrentSpec, body.EditedSection, body.Model);
+            if (string.IsNullOrEmpty(updated))
+                return Results.Problem(title: "Could not propagate to downstream sections", statusCode: 500);
+            return Results.Ok(new { markdown = updated });
+        });
+
         g.MapGet("/sources/lakehouses/{id}/tables", async (string id, HttpRequest req, FabricService fabric) =>
         {
             var tok = FabricToken(req);
