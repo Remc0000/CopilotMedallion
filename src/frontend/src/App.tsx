@@ -207,8 +207,10 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const [autoFixing, setAutoFixing] = useState(false)
   const triedAutoFixForKey = useRef<Set<string>>(new Set())
   const lastErrorSignatureRef = useRef<string | null>(null)
+  const sameSignatureCountRef = useRef<number>(0)
   const [stuckOnSameError, setStuckOnSameError] = useState(false)
   const [nowTick, setNowTick] = useState(() => Date.now())
+  const [usage, setUsage] = useState<{promptTokens:number; completionTokens:number; totalTokens:number; requests:number; estimatedCostUsd:number; perModel: {model:string; promptTokens:number; completionTokens:number; requests:number}[]} | null>(null)
   useEffect(() => {
     // Tick once a second so the elapsed clock updates while a build is active.
     const id = setInterval(() => setNowTick(Date.now()), 1000)
@@ -395,6 +397,42 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     })()
   }, [effectivelySignedIn, fabricItemId])
 
+  // Resilient back-fill: if sourceId is set but workspace/lakehouse names are still null
+  // (e.g., the host iframe never sent them, or the previous back-fill 404'd), keep retrying
+  // until both names are known. Bounded retries with simple linear backoff.
+  useEffect(() => {
+    if (!effectivelySignedIn) return
+    if (!sourceId) return
+    if (sourceLakehouseName && sourceWorkspaceName) return
+    const sw = sourceWorkspaceOverride
+    let attempt = 0
+    let cancelled = false
+    async function tick() {
+      while (!cancelled && attempt < 6 && (!sourceLakehouseName || !sourceWorkspaceName)) {
+        attempt++
+        try {
+          const { fabric } = await ensureToken()
+          if (sw && !sourceWorkspaceName) {
+            try {
+              const r = await api<{ id: string; displayName: string | null }>(`/api/workspaces/${sw}`, fabric)
+              if (!cancelled && r.displayName) setSourceWorkspaceName(r.displayName)
+            } catch { /* ignore */ }
+          }
+          if (sourceId && !sourceLakehouseName) {
+            try {
+              const swQs = sw ? `?workspaceId=${sw}` : ''
+              const r = await api<{ id: string; displayName: string }>(`/api/sources/lakehouses/${sourceId}${swQs}`, fabric)
+              if (!cancelled && r.displayName) setSourceLakehouseName(r.displayName)
+            } catch { /* ignore */ }
+          }
+        } catch { /* token failure — try again next tick */ }
+        await new Promise(r => setTimeout(r, 1500 * attempt))
+      }
+    }
+    tick()
+    return () => { cancelled = true }
+  }, [effectivelySignedIn, sourceId, sourceWorkspaceOverride, sourceLakehouseName, sourceWorkspaceName])
+
   async function ensureToken() {
     const t = await getFabricToken(instance, appConfig.scope)
     setToken(t)
@@ -449,6 +487,22 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       }
     })()
   }, [sourceId, token, inFabricRuntime])
+
+  useEffect(() => {
+    if (!run) { setUsage(null); return }
+    let cancelled = false
+    async function fetchOnce() {
+      try {
+        const { fabric } = await ensureToken()
+        const u = await api<any>(`/api/runs/${run!.runId}/usage`, fabric)
+        if (!cancelled) setUsage(u)
+      } catch { /* ignore */ }
+    }
+    fetchOnce()
+    const terminal = ['Succeeded','Failed','Cancelled'].includes(run.status)
+    const id = terminal ? null : setInterval(fetchOnce, 5000)
+    return () => { cancelled = true; if (id) clearInterval(id) }
+  }, [run?.runId, run?.status])
 
   useEffect(() => {
     if (!run) return
@@ -543,6 +597,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     setCurrentIteration(1)
     triedAutoFixForKey.current.clear()
     lastErrorSignatureRef.current = null
+    sameSignatureCountRef.current = 0
     setStuckOnSameError(false)
     setSparkError(null)
     try {
@@ -578,6 +633,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     setCurrentIteration(1)
     triedAutoFixForKey.current.clear()
     lastErrorSignatureRef.current = null
+    sameSignatureCountRef.current = 0
     setStuckOnSameError(false)
     setSparkError(null)
     try {
@@ -716,21 +772,35 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       console.log('[autoFix] skip: already tried', key)
       return
     }
-    triedAutoFixForKey.current.add(key)
 
     const signature = signatureFromTrace(sparkError)
-    if (lastErrorSignatureRef.current && lastErrorSignatureRef.current === signature) {
-      console.log('[autoFix] STUCK: signature matches previous iteration')
+    if (lastErrorSignatureRef.current === signature) {
+      sameSignatureCountRef.current += 1
+    } else {
+      sameSignatureCountRef.current = 1
+    }
+    // Only declare "stuck" after 3 consecutive identical signatures — gives the LLM
+    // a few real chances even when its first fix attempt didn't move the needle.
+    if (sameSignatureCountRef.current >= 3) {
+      console.log('[autoFix] STUCK: signature repeated', sameSignatureCountRef.current, 'times')
       setStuckOnSameError(true)
       return
     }
     lastErrorSignatureRef.current = signature
-    console.log('[autoFix] starting iteration', currentIteration + 1, 'of', maxIterations)
+    console.log('[autoFix] starting iteration', currentIteration + 1, 'of', maxIterations, 'signature-streak=', sameSignatureCountRef.current)
 
     setAutoFixing(true)
     setError(null); setBusy(true)
     autoFixAndRebuild()
-      .catch(e => { console.error('[autoFix] failed', e); setError(`Auto-fix failed: ${String(e)}`) })
+      .then(ok => {
+        // Only mark this iteration as "consumed" once it actually succeeded; if it threw
+        // (LLM hiccup, build call 5xx, etc.) leave the key out so the next tick can retry.
+        if (ok) triedAutoFixForKey.current.add(key)
+      })
+      .catch(e => {
+        console.error('[autoFix] failed', e)
+        setError(`Auto-fix failed (will retry): ${String(e)}`)
+      })
       .finally(() => { setAutoFixing(false); setBusy(false); setBusyMsg('') })
   }, [run?.runId, run?.status, sparkError, currentIteration, maxIterations, stuckOnSameError])
 
@@ -847,8 +917,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           {inFabricRuntime ? (
             sourceId ? (
               <div className={s.status}>
-                <div>Source Lakehouse: <strong>{sourceLakehouseName ?? '(unknown)'}</strong></div>
-                <div>Source Workspace: <strong>{sourceWorkspaceName ?? '(unknown)'}</strong></div>
+                <div>Source Workspace: <strong>{sourceWorkspaceName ?? '(loading…)'}</strong></div>
+                <div>Source Lakehouse: <strong>{sourceLakehouseName ?? '(loading…)'}</strong></div>
                 <div>{selectedTables.size} table{selectedTables.size === 1 ? '' : 's'} selected</div>
               </div>
             ) : (
@@ -1028,6 +1098,12 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                   {isFinite(startedMs) && (
                     <> · {isTerminal ? 'took' : 'elapsed'} <strong>⏱ {formatElapsed(elapsed)}</strong></>
                   )}
+                  {usage && usage.totalTokens > 0 && (
+                    <> · 🪙 <strong>{usage.totalTokens.toLocaleString()}</strong> tokens
+                      {' '}<Caption1 as="span">({usage.promptTokens.toLocaleString()} in / {usage.completionTokens.toLocaleString()} out · {usage.requests} call{usage.requests === 1 ? '' : 's'})</Caption1>
+                      {usage.estimatedCostUsd > 0 && <> · ~<strong>${usage.estimatedCostUsd.toFixed(4)}</strong></>}
+                    </>
+                  )}
                 </Body1>
               )
             })()}
@@ -1085,22 +1161,22 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               </MessageBar>
               <div className={s.row}>
                 {run.targetLakehouseId && run.workspaceId && (
-                  <Button appearance="primary" onClick={() => window.open(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`, '_blank', 'noopener,noreferrer')}>
+                  <Button appearance="primary" as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`} target="_blank" rel="noopener noreferrer">
                     Open Lakehouse
                   </Button>
                 )}
                 {run.bronzeNotebookId && run.workspaceId && (
-                  <Button onClick={() => window.open(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`, '_blank', 'noopener,noreferrer')}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`} target="_blank" rel="noopener noreferrer">
                     Open Bronze
                   </Button>
                 )}
                 {run.silverNotebookId && run.workspaceId && (
-                  <Button onClick={() => window.open(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`, '_blank', 'noopener,noreferrer')}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`} target="_blank" rel="noopener noreferrer">
                     Open Silver
                   </Button>
                 )}
                 {run.goldNotebookId && run.workspaceId && (
-                  <Button onClick={() => window.open(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`, '_blank', 'noopener,noreferrer')}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`} target="_blank" rel="noopener noreferrer">
                     Open Gold
                   </Button>
                 )}
@@ -1148,17 +1224,17 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                                 : run.currentLayer === 'bronze' ? run.bronzeNotebookId
                                 : (run.goldNotebookId ?? run.silverNotebookId ?? run.bronzeNotebookId)
                   return layerNb && run.workspaceId && (
-                    <Button onClick={() => window.open(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`, '_blank', 'noopener,noreferrer')}>
+                    <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`} target="_blank" rel="noopener noreferrer">
                       Open failed {run.currentLayer ?? ''} notebook
                     </Button>
                   )
                 })()}
                 {run.workspaceId && (
-                  <Button onClick={() => window.open(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`, '_blank', 'noopener,noreferrer')}>
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`} target="_blank" rel="noopener noreferrer">
                     Open Workspace
                   </Button>
                 )}
-                <Button onClick={() => window.open('https://app.fabric.microsoft.com/monitoringhub?experience=power-bi', '_blank', 'noopener,noreferrer')}>
+                <Button as="a" href={'https://app.fabric.microsoft.com/monitoringhub?experience=power-bi'} target="_blank" rel="noopener noreferrer">
                   Open Monitoring Hub
                 </Button>
               </div>

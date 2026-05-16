@@ -517,6 +517,27 @@ public static class ApiEndpoints
             return Results.Ok(run);
         });
 
+        g.MapGet("/runs/{runId}/usage", (string runId, RunUsageTracker usage) =>
+        {
+            var u = usage.Get(runId);
+            if (u is null) return Results.Ok(new {
+                promptTokens = 0, completionTokens = 0, totalTokens = 0,
+                requests = 0, estimatedCostUsd = 0m,
+                perModel = Array.Empty<object>()
+            });
+            return Results.Ok(new {
+                promptTokens = u.PromptTokens,
+                completionTokens = u.CompletionTokens,
+                totalTokens = u.TotalTokens,
+                requests = u.Requests,
+                estimatedCostUsd = u.EstimatedCostUsd,
+                perModel = u.PerModel.Values.Select(m => new {
+                    model = m.Model, promptTokens = m.PromptTokens,
+                    completionTokens = m.CompletionTokens, requests = m.Requests
+                }).ToArray()
+            });
+        });
+
         return app;
     }
 }

@@ -204,7 +204,7 @@ source_tables_csv = {string.Join(",", sourceTables)}
 Produce the JSON now.";
 
         string answer;
-        try { answer = await _llm.ChatAsync(system, user, maxTokens: 32000, temperature: 0.1, model: model); }
+        try { answer = await _llm.ChatAsync(system, user, maxTokens: 32000, temperature: 0.1, model: model, runId: runId); }
         catch (Exception ex) { _log.LogWarning(ex, "LLM cell-gen failed"); return null; }
 
         var json = ExtractJson(answer);
@@ -385,7 +385,7 @@ Produce the spec markdown now. Base every modeling decision on the columns above
 
         try
         {
-            return await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.3, model: model);
+            return await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.3, model: model, runId: runId);
         }
         catch (Exception ex)
         {
@@ -441,7 +441,7 @@ Rules:
 Produce the updated spec markdown now. Remember to PREPEND a '## Updated specs' changelog entry between '# Run Spec' and '## Inputs'.";
         try
         {
-            return await _llm.ChatAsync(system, user, maxTokens: 12000, temperature: 0.1, model: model);
+            return await _llm.ChatAsync(system, user, maxTokens: 12000, temperature: 0.1, model: model, runId: runId);
         }
         catch (Exception ex)
         {

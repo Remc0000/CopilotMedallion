@@ -16,8 +16,9 @@ public class LlmService
     private readonly DefaultAzureCredential _cred = new DefaultAzureCredential();
     private (string Token, DateTimeOffset ExpiresOn)? _cachedToken;
     private readonly ILogger<LlmService> _log;
+    private readonly RunUsageTracker _usage;
 
-    public LlmService(IHttpClientFactory http, IConfiguration cfg, ILogger<LlmService> log)
+    public LlmService(IHttpClientFactory http, IConfiguration cfg, ILogger<LlmService> log, RunUsageTracker usage)
     {
         _http = http;
         _endpoint = (cfg["OpenAI:Endpoint"] ?? "").TrimEnd('/');
@@ -28,6 +29,7 @@ public class LlmService
             ? new[] { _defaultDeployment }.Where(s => !string.IsNullOrEmpty(s)).ToArray()
             : models.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         _log = log;
+        _usage = usage;
     }
 
     public bool Configured => !string.IsNullOrEmpty(_endpoint) && !string.IsNullOrEmpty(_defaultDeployment);
@@ -49,7 +51,7 @@ public class LlmService
         return tok.Token;
     }
 
-    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2, string? model = null)
+    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2, string? model = null, string? runId = null)
     {
         if (!Configured) throw new InvalidOperationException("Azure OpenAI not configured.");
         var deployment = string.IsNullOrWhiteSpace(model) ? _defaultDeployment : model;
@@ -89,6 +91,17 @@ public class LlmService
         var raw = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode) throw new Exception($"LLM call failed {resp.StatusCode} (model={deployment}): {raw}");
         using var doc = JsonDocument.Parse(raw);
+        // Record token usage against the run so the UI can display tokens + estimated cost.
+        try
+        {
+            if (!string.IsNullOrEmpty(runId) && doc.RootElement.TryGetProperty("usage", out var usage))
+            {
+                int prompt = usage.TryGetProperty("prompt_tokens", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
+                int completion = usage.TryGetProperty("completion_tokens", out var ct) && ct.ValueKind == JsonValueKind.Number ? ct.GetInt32() : 0;
+                _usage.Record(runId, deployment, prompt, completion);
+            }
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "usage recording failed"); }
         return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
     }
 }
