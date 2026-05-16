@@ -14,6 +14,7 @@ if (inFabric) {
     if (ev.data?.type === 'copilot-medallion-tokens') {
       if (ev.data.fabricToken) fabricTokenFromHost = ev.data.fabricToken
       if (ev.data.storageToken) storageTokenFromHost = ev.data.storageToken
+      if (ev.data.onelakeToken) storageTokenFromHost = ev.data.onelakeToken
     }
   })
   window.parent?.postMessage({ type: 'copilot-medallion-ready' }, '*')

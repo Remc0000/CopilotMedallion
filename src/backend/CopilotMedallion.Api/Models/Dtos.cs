@@ -19,7 +19,9 @@ public record PreviewSpecsResponse(string Markdown, string RunId, string TargetL
 
 public record GenerateSpecsResponse(string RunId, string Branch, string SpecUrl, string SpecRawUrl);
 
-public record BuildRequest(string RunId);
+public record BuildRequest(string RunId, string? Model = null);
+public record FixSpecRequest(string CurrentSpec, string ErrorTrace, string? Model = null, int? Iteration = null, string? FailedLayer = null);
+public record ProposeSpecRequest(string SourceLakehouseId, string SourceLakehouseName, List<string> Tables, string? TargetLakehouseName, string? Model = null);
 
 public record RunInfo(
     string RunId,
@@ -36,5 +38,16 @@ public record RunInfo(
     string? Message,
     DateTime CreatedAt,
     DateTime UpdatedAt,
-    string? TargetWorkspaceId = null
+    string? TargetWorkspaceId = null,
+    string? SourceWorkspaceId = null,
+    string? BronzeNotebookId = null,
+    string? SilverNotebookId = null,
+    string? GoldNotebookId = null,
+    string? BronzeJobId = null,
+    string? SilverJobId = null,
+    string? GoldJobId = null,
+    string? CurrentLayer = null,
+    string? ReportingNotebookId = null,
+    string? ReportingJobId = null,
+    string? SpecMarkdown = null
 );

@@ -16,6 +16,7 @@ export interface Run {
   status: string
   branch?: string
   specUrl?: string
+  workspaceId?: string
   sourceLakehouseId?: string
   tablesCsv?: string
   targetLakehouseId?: string
@@ -25,4 +26,13 @@ export interface Run {
   message?: string
   createdAt: string
   updatedAt: string
+  bronzeNotebookId?: string
+  silverNotebookId?: string
+  goldNotebookId?: string
+  reportingNotebookId?: string
+  bronzeJobId?: string
+  silverJobId?: string
+  goldJobId?: string
+  reportingJobId?: string
+  currentLayer?: string
 }

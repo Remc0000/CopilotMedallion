@@ -10,8 +10,9 @@ public class LlmService
 {
     private readonly IHttpClientFactory _http;
     private readonly string _endpoint;
-    private readonly string _deployment;
+    private readonly string _defaultDeployment;
     private readonly string _apiVersion;
+    private readonly string[] _availableModels;
     private readonly DefaultAzureCredential _cred = new DefaultAzureCredential();
     private (string Token, DateTimeOffset ExpiresOn)? _cachedToken;
     private readonly ILogger<LlmService> _log;
@@ -20,12 +21,24 @@ public class LlmService
     {
         _http = http;
         _endpoint = (cfg["OpenAI:Endpoint"] ?? "").TrimEnd('/');
-        _deployment = cfg["OpenAI:Deployment"] ?? "";
-        _apiVersion = cfg["OpenAI:ApiVersion"] ?? "2024-10-21";
+        _defaultDeployment = cfg["OpenAI:Deployment"] ?? "";
+        _apiVersion = cfg["OpenAI:ApiVersion"] ?? "2025-04-01-preview";
+        var models = cfg["OpenAI:Models"];
+        _availableModels = string.IsNullOrWhiteSpace(models)
+            ? new[] { _defaultDeployment }.Where(s => !string.IsNullOrEmpty(s)).ToArray()
+            : models.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         _log = log;
     }
 
-    public bool Configured => !string.IsNullOrEmpty(_endpoint) && !string.IsNullOrEmpty(_deployment);
+    public bool Configured => !string.IsNullOrEmpty(_endpoint) && !string.IsNullOrEmpty(_defaultDeployment);
+    public string DefaultModel => _defaultDeployment;
+    public IReadOnlyList<string> AvailableModels => _availableModels;
+
+    private static bool IsReasoningModel(string deployment) =>
+        deployment.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase)
+        || deployment.StartsWith("o1", StringComparison.OrdinalIgnoreCase)
+        || deployment.StartsWith("o3", StringComparison.OrdinalIgnoreCase)
+        || deployment.StartsWith("o4", StringComparison.OrdinalIgnoreCase);
 
     private async Task<string> GetTokenAsync()
     {
@@ -36,26 +49,45 @@ public class LlmService
         return tok.Token;
     }
 
-    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2)
+    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2, string? model = null)
     {
         if (!Configured) throw new InvalidOperationException("Azure OpenAI not configured.");
+        var deployment = string.IsNullOrWhiteSpace(model) ? _defaultDeployment : model;
         var token = await GetTokenAsync();
         var c = _http.CreateClient();
-        c.Timeout = TimeSpan.FromMinutes(3);
+        c.Timeout = TimeSpan.FromMinutes(5);
         c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        var url = $"{_endpoint}/openai/deployments/{_deployment}/chat/completions?api-version={_apiVersion}";
-        var body = new
+        var url = $"{_endpoint}/openai/deployments/{deployment}/chat/completions?api-version={_apiVersion}";
+
+        object body;
+        if (IsReasoningModel(deployment))
         {
-            messages = new object[] {
-                new { role = "system", content = systemPrompt },
-                new { role = "user", content = userPrompt }
-            },
-            max_tokens = maxTokens,
-            temperature
-        };
+            // gpt-5 / o-series: max_completion_tokens, no temperature override (must be default 1)
+            body = new
+            {
+                messages = new object[] {
+                    new { role = "system", content = systemPrompt },
+                    new { role = "user", content = userPrompt }
+                },
+                max_completion_tokens = Math.Max(maxTokens, 8000)
+            };
+        }
+        else
+        {
+            body = new
+            {
+                messages = new object[] {
+                    new { role = "system", content = systemPrompt },
+                    new { role = "user", content = userPrompt }
+                },
+                max_tokens = maxTokens,
+                temperature
+            };
+        }
+
         var resp = await c.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
         var raw = await resp.Content.ReadAsStringAsync();
-        if (!resp.IsSuccessStatusCode) throw new Exception($"LLM call failed {resp.StatusCode}: {raw}");
+        if (!resp.IsSuccessStatusCode) throw new Exception($"LLM call failed {resp.StatusCode} (model={deployment}): {raw}");
         using var doc = JsonDocument.Parse(raw);
         return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
     }
