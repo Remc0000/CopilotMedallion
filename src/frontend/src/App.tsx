@@ -13,7 +13,7 @@ const useStyles = makeStyles({
   shell: { maxWidth: '960px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column' as const, gap: '14px' },
   headerBar: { display: 'flex', alignItems: 'center', gap: '14px', paddingBottom: '8px', borderBottom: `1px solid ${tokens.colorNeutralStroke2}`, marginBottom: '6px' },
   headerTitle: { flex: 1 },
-  logo: { height: '168px', width: 'auto' },
+  logo: { height: '120px', width: 'auto' },
   logoLeft: { height: '120px', width: 'auto' },
   row: { display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' as const },
   status: { padding: '12px 16px', backgroundColor: tokens.colorNeutralBackground2, borderRadius: '6px', lineHeight: 1.7 },
@@ -88,6 +88,34 @@ type BuildStep = {
   title: string
   sub?: string
   state: 'pending' | 'active' | 'done' | 'failed'
+}
+
+function openExternal(url: string) {
+  // Multi-strategy opener that works whether the page is loaded standalone, inside a
+  // Fabric workload iframe (which often sandboxes window.open), or anywhere in between.
+  try {
+    // 1) Ask the outer Fabric host to open it — outer can call window.open from its
+    //    own origin which is not sandbox-restricted. If the outer doesn't listen, this
+    //    is a no-op and we fall through to strategy 2.
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage({ type: 'copilot-medallion-open-external', url }, '*')
+    }
+  } catch { /* ignore */ }
+  // 2) Native window.open. If the browser allows popups for this iframe (most do when
+  //    the call originates from a user gesture), the new tab opens.
+  const w = window.open(url, '_blank', 'noopener,noreferrer')
+  if (w) return
+  // 3) Synthetic anchor click. This sometimes succeeds where window.open is denied
+  //    because the browser treats it as an anchor activation, not a script-triggered popup.
+  try {
+    const a = document.createElement('a')
+    a.href = url
+    a.target = '_blank'
+    a.rel = 'noopener noreferrer'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } catch { /* ignore */ }
 }
 
 function formatElapsed(ms: number): string {
@@ -384,6 +412,10 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         if (resp?.run) {
           setRun(resp.run)
           if (resp.run.sourceLakehouseId) setSourceId(resp.run.sourceLakehouseId)
+          if (resp.run.sourceWorkspaceId) {
+            setSourceWorkspaceOverride(resp.run.sourceWorkspaceId)
+            ;(window as any).__copilotMedallionSourceWs = resp.run.sourceWorkspaceId
+          }
           if (resp.run.tablesCsv) setSelectedTables(new Set(resp.run.tablesCsv.split(',').filter(Boolean)))
           if (resp.run.targetLakehouseName) setTargetName(resp.run.targetLakehouseName)
           if (resp.specMarkdown) setSpecDraft(resp.specMarkdown)
@@ -1161,22 +1193,22 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               </MessageBar>
               <div className={s.row}>
                 {run.targetLakehouseId && run.workspaceId && (
-                  <Button appearance="primary" as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`} target="_blank" rel="noopener noreferrer">
+                  <Button appearance="primary" as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/lakehouses/${run.targetLakehouseId}`) }}>
                     Open Lakehouse
                   </Button>
                 )}
                 {run.bronzeNotebookId && run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`} target="_blank" rel="noopener noreferrer">
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.bronzeNotebookId}`) }}>
                     Open Bronze
                   </Button>
                 )}
                 {run.silverNotebookId && run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`} target="_blank" rel="noopener noreferrer">
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.silverNotebookId}`) }}>
                     Open Silver
                   </Button>
                 )}
                 {run.goldNotebookId && run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`} target="_blank" rel="noopener noreferrer">
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${run.goldNotebookId}`) }}>
                     Open Gold
                   </Button>
                 )}
@@ -1224,17 +1256,17 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                                 : run.currentLayer === 'bronze' ? run.bronzeNotebookId
                                 : (run.goldNotebookId ?? run.silverNotebookId ?? run.bronzeNotebookId)
                   return layerNb && run.workspaceId && (
-                    <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`} target="_blank" rel="noopener noreferrer">
+                    <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`) }}>
                       Open failed {run.currentLayer ?? ''} notebook
                     </Button>
                   )
                 })()}
                 {run.workspaceId && (
-                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`} target="_blank" rel="noopener noreferrer">
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`) }}>
                     Open Workspace
                   </Button>
                 )}
-                <Button as="a" href={'https://app.fabric.microsoft.com/monitoringhub?experience=power-bi'} target="_blank" rel="noopener noreferrer">
+                <Button as="a" href={'https://app.fabric.microsoft.com/monitoringhub?experience=power-bi'} target="_blank" rel="noopener noreferrer" onClick={(e) => { try { e.preventDefault() } catch {} ; openExternal('https://app.fabric.microsoft.com/monitoringhub?experience=power-bi') }}>
                   Open Monitoring Hub
                 </Button>
               </div>

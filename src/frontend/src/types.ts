@@ -17,6 +17,7 @@ export interface Run {
   branch?: string
   specUrl?: string
   workspaceId?: string
+  sourceWorkspaceId?: string
   sourceLakehouseId?: string
   tablesCsv?: string
   targetLakehouseId?: string
