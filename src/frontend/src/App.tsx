@@ -228,7 +228,6 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const [busy, setBusy] = useState(false)
   const [busyMsg, setBusyMsg] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [specs, setSpecs] = useState<SpecResponse | null>(null)
   const [run, setRun] = useState<Run | null>(null)
 
   const [maxIterations, setMaxIterations] = useState(5)
@@ -329,25 +328,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         const lhId = ev.data.lakehouseId || null
         setSourceId(lhId)
         setSourceLakehouseName(ev.data.lakehouseName || null)
-        // Back-fill any missing names by asking the backend.
-        if (sw && !ev.data.workspaceName) {
-          ;(async () => {
-            try {
-              const { fabric } = await ensureToken()
-              const r = await api<{ id: string; displayName: string | null }>(`/api/workspaces/${sw}`, fabric)
-              if (r.displayName) setSourceWorkspaceName(r.displayName)
-            } catch { /* ignore */ }
-          })()
-        }
-        if (sw && lhId && !ev.data.lakehouseName) {
-          ;(async () => {
-            try {
-              const { fabric } = await ensureToken()
-              const r = await api<{ id: string; displayName: string }>(`/api/sources/lakehouses/${lhId}?workspaceId=${sw}`, fabric)
-              if (r.displayName) setSourceLakehouseName(r.displayName)
-            } catch { /* ignore */ }
-          })()
-        }
+        // Names that weren't included in the picker payload will be back-filled by the
+        // resilient retry effect below (it watches sourceId + missing names).
         const tabs: string[] = Array.isArray(ev.data.tables) ? ev.data.tables : []
         const schemas: string[] = Array.isArray(ev.data.schemas) ? ev.data.schemas : []
         if (tabs.length === 0 && ev.data.onlyRoot && lhId) {
@@ -522,33 +504,34 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     })()
   }, [sourceId, token, inFabricRuntime])
 
+  // Unified poll: fetches both run status and token-usage on the same 4s tick.
+  // - Usage continues polling 1 extra tick after the run reaches a terminal state to
+  //   capture the final cost numbers.
+  // - When the run is terminal (SpecsReady/Succeeded/Failed/Cancelled), the run-status
+  //   poll stops; usage poll then also stops.
   useEffect(() => {
     if (!run) { setUsage(null); return }
     let cancelled = false
-    async function fetchOnce() {
+    async function tick() {
       try {
         const { fabric } = await ensureToken()
-        const u = await api<any>(`/api/runs/${run!.runId}/usage`, fabric)
-        if (!cancelled) setUsage(u)
-      } catch { /* ignore */ }
+        const isTerminal = ['SpecsReady','Succeeded','Failed','Cancelled'].includes(run!.status)
+        const fetches: Promise<unknown>[] = [
+          api<any>(`/api/runs/${run!.runId}/usage`, fabric).then(u => { if (!cancelled) setUsage(u) }).catch(() => {})
+        ]
+        if (!isTerminal) {
+          fetches.push(
+            api<Run>(`/api/runs/${run!.runId}`, fabric).then(r => { if (!cancelled) setRun(r) }).catch(() => {})
+          )
+        }
+        await Promise.all(fetches)
+      } catch { /* token failure — retry next tick */ }
     }
-    fetchOnce()
+    tick()
     const terminal = ['Succeeded','Failed','Cancelled'].includes(run.status)
-    const id = terminal ? null : setInterval(fetchOnce, 5000)
+    // Active runs: 4s. Terminal: do one final usage fetch above, no further polling.
+    const id = terminal ? null : setInterval(tick, 4000)
     return () => { cancelled = true; if (id) clearInterval(id) }
-  }, [run?.runId, run?.status])
-
-  useEffect(() => {
-    if (!run) return
-    if (['SpecsReady','Succeeded','Failed','Cancelled'].includes(run.status)) return
-    const id = setInterval(async () => {
-      try {
-        const { fabric } = await ensureToken()
-        const r = await api<Run>(`/api/runs/${run.runId}`, fabric)
-        setRun(r)
-      } catch (e) { /* ignore polling errors */ }
-    }, 4000)
-    return () => clearInterval(id)
   }, [run?.runId, run?.status])
 
   // Fetch persisted Spark error traceback once a run lands in Failed.
@@ -663,7 +646,6 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           existingRunId: run?.runId ?? null,
         })
       })
-      setSpecs(resp)
       setBusyMsg('Creating lakehouse + starting orchestrator notebook…')
       const r = await api<Run>('/api/build', fabric, {
         method: 'POST',
@@ -712,8 +694,8 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       if (r.markdown) {
         setSpecDraft(r.markdown)
         setTimeout(() => {
-          // Open the medallion section so the user can see the diff (most fixes target gold)
-          setOpenSection('medallion')
+          // Open the gold section by default since most LLM fixes target it
+          setOpenSection('gold')
         }, 100)
       }
     } catch (e: any) { setError(String(e)) }

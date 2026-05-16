@@ -12,8 +12,9 @@ public static class ApiEndpoints
     {
         var g = app.MapGroup("/api");
 
-        g.MapGet("/health", () => Results.Ok(new { ok = true, ts = DateTime.UtcNow }));
-
+        // /api/config is consumed by the React app on boot to pick up tenant/client/scope
+        // and (optionally) the GitHub history-repo display name. /api/health was added once
+        // for a smoke test but is never called by anything in the deployed app.
         g.MapGet("/config", (IConfiguration cfg) => Results.Ok(new
         {
             tenantId = cfg["AzureAd:TenantId"],
@@ -200,13 +201,12 @@ public static class ApiEndpoints
             // GitHub push is optional/best-effort for human-readable history.
             string branch = "(local)";
             string blobUrl = "(stored in lakehouse Files/spec.md)";
-            string rawUrl = "(local)";
             if (gh.Configured)
             {
                 try
                 {
-                    var (br, blob, raw) = await gh.PushSpecAsync(runId, spec);
-                    branch = br; blobUrl = blob; rawUrl = raw;
+                    var (br, blob, _) = await gh.PushSpecAsync(runId, spec);
+                    branch = br; blobUrl = blob;
                 }
                 catch (Exception ex)
                 {
@@ -241,7 +241,7 @@ public static class ApiEndpoints
                 }
             }
             catch { /* best-effort */ }
-            return Results.Ok(new GenerateSpecsResponse(runId, branch, blobUrl, rawUrl));
+            return Results.Ok(new GenerateSpecsResponse(runId, branch, blobUrl));
         });
 
         g.MapGet("/guidance", async (HttpRequest req, IRunStore store) =>

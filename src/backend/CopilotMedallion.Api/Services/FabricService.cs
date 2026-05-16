@@ -109,9 +109,7 @@ public class FabricService
             {
                 foreach (var e in arr.EnumerateArray())
                 {
-                    result.Add(new SourceTable(
-                        e.GetProperty("name").GetString()!,
-                        e.TryGetProperty("location", out var loc) ? (loc.GetString() ?? "") : ""));
+                    result.Add(new SourceTable(e.GetProperty("name").GetString()!));
                 }
             }
             return result;
@@ -153,7 +151,7 @@ public class FabricService
             .Distinct()
             .OrderBy(p => p)
             .ToList();
-        return deltaLogs.Select(n => new SourceTable(n, $"Tables/{n}")).ToList();
+        return deltaLogs.Select(n => new SourceTable(n)).ToList();
     }
 
     /// <summary>
@@ -664,7 +662,7 @@ public class FabricService
         }
         var body = new { executionData };
         var json = JsonSerializer.Serialize(body);
-        _log.LogInformation("RunNotebook POST body: {body}", json);
+        _log.LogDebug("RunNotebook POST body: {body}", json);
         var resp = await c.PostAsync(
             $"workspaces/{ws}/items/{notebookId}/jobs/instances?jobType=RunNotebook",
             new StringContent(json, Encoding.UTF8, "application/json"));

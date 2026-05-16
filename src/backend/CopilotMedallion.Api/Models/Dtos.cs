@@ -1,6 +1,6 @@
 namespace CopilotMedallion.Api.Models;
 
-public record SourceTable(string Name, string Path);
+public record SourceTable(string Name);
 
 public record LakehouseInfo(string Id, string DisplayName, string WorkspaceId, string? Description);
 
@@ -17,7 +17,7 @@ public record PreviewSpecsRequest(string SourceLakehouseId, List<string> Tables,
 
 public record PreviewSpecsResponse(string Markdown, string RunId, string TargetLakehouseName);
 
-public record GenerateSpecsResponse(string RunId, string Branch, string SpecUrl, string SpecRawUrl);
+public record GenerateSpecsResponse(string RunId, string Branch, string SpecUrl);
 
 public record BuildRequest(string RunId, string? Model = null);
 public record FixSpecRequest(string CurrentSpec, string ErrorTrace, string? Model = null, int? Iteration = null, string? FailedLayer = null);
