@@ -89,6 +89,16 @@ type BuildStep = {
   state: 'pending' | 'active' | 'done' | 'failed'
 }
 
+function formatElapsed(ms: number): string {
+  if (!isFinite(ms) || ms < 0) ms = 0
+  const totalSec = Math.floor(ms / 1000)
+  const h = Math.floor(totalSec / 3600)
+  const m = Math.floor((totalSec % 3600) / 60)
+  const sec = totalSec % 60
+  const pad = (n: number) => n.toString().padStart(2, '0')
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`
+}
+
 function statusToSteps(status: string, run: Run, model: string | null): BuildStep[] {
   const s = status
   const failed = s === 'Failed' || s === 'Cancelled'
@@ -197,6 +207,12 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const triedAutoFixForKey = useRef<Set<string>>(new Set())
   const lastErrorSignatureRef = useRef<string | null>(null)
   const [stuckOnSameError, setStuckOnSameError] = useState(false)
+  const [nowTick, setNowTick] = useState(() => Date.now())
+  useEffect(() => {
+    // Tick once a second so the elapsed clock updates while a build is active.
+    const id = setInterval(() => setNowTick(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
   const [guidanceOpen, setGuidanceOpen] = useState(false)
   const [guidanceItems, setGuidanceItems] = useState<{id:number; capturedAt:string; runId:string; content:string}[] | null>(null)
   const [guidanceLoading, setGuidanceLoading] = useState(false)
@@ -994,14 +1010,23 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         <Card>
           <CardHeader
             header={<Title3>5. Build status</Title3>}
-            description={
-              <Body1>
-                Status: <strong>{run.status}</strong>
-                {selectedModel ? <> · model <code>{selectedModel}</code></> : null}
-                <> · iteration <strong>{currentIteration}</strong> of <strong>{maxIterations}</strong></>
-                {autoFixing ? <> · <em>auto-fixing…</em></> : null}
-              </Body1>
-            }
+            description={(() => {
+              const startedMs = run.createdAt ? Date.parse(run.createdAt) : NaN
+              const isTerminal = ['Succeeded','Failed','Cancelled'].includes(run.status)
+              const endMs = isTerminal && run.updatedAt ? Date.parse(run.updatedAt) : nowTick
+              const elapsed = isFinite(startedMs) ? endMs - startedMs : 0
+              return (
+                <Body1>
+                  Status: <strong>{run.status}</strong>
+                  {selectedModel ? <> · model <code>{selectedModel}</code></> : null}
+                  <> · iteration <strong>{currentIteration}</strong> of <strong>{maxIterations}</strong></>
+                  {autoFixing ? <> · <em>auto-fixing…</em></> : null}
+                  {isFinite(startedMs) && (
+                    <> · {isTerminal ? 'took' : 'elapsed'} <strong>⏱ {formatElapsed(elapsed)}</strong></>
+                  )}
+                </Body1>
+              )
+            })()}
           />
           <div className={s.status}>
             <div>Run: <code>{run.runId}</code></div>
