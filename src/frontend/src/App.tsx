@@ -13,7 +13,7 @@ const useStyles = makeStyles({
   shell: { maxWidth: '960px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column' as const, gap: '14px' },
   headerBar: { display: 'flex', alignItems: 'center', gap: '14px', paddingBottom: '8px', borderBottom: `1px solid ${tokens.colorNeutralStroke2}`, marginBottom: '6px' },
   headerTitle: { flex: 1 },
-  logo: { height: '120px', width: 'auto' },
+  logo: { height: '156px', width: 'auto' },
   logoLeft: { height: '120px', width: 'auto' },
   row: { display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' as const },
   status: { padding: '12px 16px', backgroundColor: tokens.colorNeutralBackground2, borderRadius: '6px', lineHeight: 1.7 },
@@ -886,9 +886,9 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           <img src="/logo.png" alt="Copilot Medallion" className={s.logoLeft} />
         </a>
         <div className={s.headerTitle}>
-          <Title1>🛠️ Copilot Medallion</Title1>
-          <Body1>Automated Bronze → Silver → Gold &amp; semantic model &amp; report &amp; data agent creator</Body1>
-          <Caption1>
+          <Title1 block>🛠️ Copilot Medallion</Title1>
+          <Body1 block style={{ marginTop: 2 }}>Automated Bronze → Silver → Gold &amp; semantic model &amp; report &amp; data agent creator</Body1>
+          <Caption1 block style={{ marginTop: 6 }}>
             {itemWorkspaceName ? <>Workspace: <strong>{itemWorkspaceName}</strong></> : (fabricWorkspaceId ? <>Workspace: <code>{fabricWorkspaceId}</code></> : null)}
             {signedIn && <> · <FLink onClick={signOut} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>Sign out</FLink></>}
             {effectivelySignedIn && <> · <FLink onClick={() => { setGuidanceOpen(true); if (!guidanceItems) loadGuidance() }} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>📚 Guidance history</FLink></>}
@@ -983,7 +983,16 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               <div className={s.status}>
                 <div>Source Workspace: <strong>{sourceWorkspaceName ?? '(loading…)'}</strong></div>
                 <div>Source Lakehouse: <strong>{sourceLakehouseName ?? '(loading…)'}</strong></div>
-                <div>{selectedTables.size} table{selectedTables.size === 1 ? '' : 's'} selected</div>
+                <div>
+                  <strong>{selectedTables.size}</strong> table{selectedTables.size === 1 ? '' : 's'} selected:
+                </div>
+                {selectedTables.size > 0 && (
+                  <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: '4px 8px', maxHeight: 220, overflow: 'auto', padding: '6px 8px', background: tokens.colorNeutralBackground3, borderRadius: 4 }}>
+                    {Array.from(selectedTables).sort().map(t => (
+                      <code key={t} style={{ fontSize: 12, background: tokens.colorNeutralBackground1, padding: '2px 6px', borderRadius: 3 }}>{t}</code>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <Body1>Use <b>Pick source Lakehouse & tables…</b> at the top to choose what to ingest.</Body1>
