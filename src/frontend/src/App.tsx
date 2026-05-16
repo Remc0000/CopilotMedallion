@@ -698,7 +698,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   }
 
   async function fixSpec() {
-    if (!run || !sparkError) return
+    if (!run || !effectiveErrorTrace) return
     if (!specDraft) {
       setError('No spec to fix — open the spec editor first.')
       return
@@ -709,7 +709,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       const { fabric } = await ensureToken()
       const r = await api<{ markdown: string }>(`/api/runs/${run.runId}/fix-spec`, fabric, {
         method: 'POST',
-        body: JSON.stringify({ currentSpec: combined, errorTrace: sparkError, model: selectedModel, iteration: currentIteration, failedLayer: run.currentLayer })
+        body: JSON.stringify({ currentSpec: combined, errorTrace: effectiveErrorTrace, model: selectedModel, iteration: currentIteration, failedLayer: run.currentLayer })
       })
       if (r.markdown) {
         setSpecDraft(r.markdown)
@@ -725,14 +725,14 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   // Full auto-fix-and-rebuild cycle: ask LLM to revise spec, push it, rebuild.
   // Returns true on success (build kicked off), false on failure.
   async function autoFixAndRebuild(): Promise<boolean> {
-    if (!run || !sparkError) return false
+    if (!run || !effectiveErrorTrace) return false
     const combined = recombineSpec()
     if (!combined) return false
     const { fabric } = await ensureToken()
     setBusyMsg(`Iteration ${currentIteration + 1}/${maxIterations}: revising spec...`)
     const fixResp = await api<{ markdown: string }>(`/api/runs/${run.runId}/fix-spec`, fabric, {
       method: 'POST',
-      body: JSON.stringify({ currentSpec: combined, errorTrace: sparkError, model: selectedModel, iteration: currentIteration, failedLayer: run.currentLayer })
+      body: JSON.stringify({ currentSpec: combined, errorTrace: effectiveErrorTrace, model: selectedModel, iteration: currentIteration, failedLayer: run.currentLayer })
     })
     if (!fixResp.markdown) throw new Error('No revised spec returned from the LLM.')
     setSpecDraft(fixResp.markdown)
@@ -796,9 +796,16 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   // and we still have iterations left, automatically fix + rebuild.
   // BUT: if two consecutive iterations hit the EXACT same error signature, stop —
   // the LLM is stuck and human input is needed.
+  // Effective error trace for the LLM: prefer the detailed Spark traceback (written by
+  // _save_error to lakehouse Files/error.txt), but fall back to run.message when the
+  // Spark session crashed before any cell could write the traceback (e.g.
+  // "System_Cancelled_Session_Statements_Failed"). Without this fallback the auto-fix
+  // useEffect would short-circuit on `!sparkError` and never iterate.
+  const effectiveErrorTrace = sparkError || (run?.message ?? null)
+
   useEffect(() => {
-    if (!run || !sparkError) {
-      console.log('[autoFix] skip: run=', !!run, 'sparkError=', !!sparkError)
+    if (!run || !effectiveErrorTrace) {
+      console.log('[autoFix] skip: run=', !!run, 'errorTrace=', !!effectiveErrorTrace)
       return
     }
     if (run.status !== 'Failed' && run.status !== 'Cancelled') {
@@ -823,7 +830,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       return
     }
 
-    const signature = signatureFromTrace(sparkError)
+    const signature = signatureFromTrace(effectiveErrorTrace ?? '')
     if (lastErrorSignatureRef.current === signature) {
       sameSignatureCountRef.current += 1
     } else {
@@ -859,7 +866,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         setTimeout(() => setAutoFixRetryTick(t => t + 1), 5000)
       })
       .finally(() => { setAutoFixing(false); setBusy(false); setBusyMsg('') })
-  }, [run?.runId, run?.status, sparkError, currentIteration, maxIterations, stuckOnSameError, autoFixRetryTick])
+  }, [run?.runId, run?.status, effectiveErrorTrace, currentIteration, maxIterations, stuckOnSameError, autoFixRetryTick])
 
   // Reset iteration counter whenever the user starts a fresh manual build.
   useEffect(() => {
@@ -1260,16 +1267,16 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                       Please edit the spec above directly (or click <b>✨ Fix spec with AI (manual)</b> for another try), then press <b>💾 Save spec</b> + <b>Re-build with updated spec</b>.
                     </div>
                   )}
-                  {sparkError && (
+                  {effectiveErrorTrace && (
                     <details style={{ marginTop: 8 }} open>
-                      <summary style={{ cursor: 'pointer' }}>Spark cell traceback</summary>
-                      <pre style={{ fontSize: 11, marginTop: 6, maxHeight: 320, overflow: 'auto', whiteSpace: 'pre-wrap', background: tokens.colorNeutralBackground3, padding: 8, borderRadius: 4 }}>{sparkError}</pre>
+                      <summary style={{ cursor: 'pointer' }}>{sparkError ? 'Spark cell traceback' : 'Failure message'}</summary>
+                      <pre style={{ fontSize: 11, marginTop: 6, maxHeight: 320, overflow: 'auto', whiteSpace: 'pre-wrap', background: tokens.colorNeutralBackground3, padding: 8, borderRadius: 4 }}>{effectiveErrorTrace}</pre>
                     </details>
                   )}
                 </MessageBarBody>
               </MessageBar>
               <div className={s.row}>
-                {sparkError && !autoFixing && (stuckOnSameError || currentIteration >= maxIterations) && (
+                {effectiveErrorTrace && !autoFixing && (stuckOnSameError || currentIteration >= maxIterations) && (
                   <Button appearance="primary" disabled={busy} onClick={fixSpec}>
                     ✨ Fix spec with AI (manual)
                   </Button>
