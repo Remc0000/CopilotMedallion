@@ -16,6 +16,54 @@ public class NotebookBuilder
     private readonly IHttpClientFactory _http;
     private readonly ILogger<NotebookBuilder> _log;
 
+    // Layer-agnostic Spark column-reference rules. Embedded verbatim in the
+    // '## Generic guidance' section of every spec proposed for a new item so the
+    // notebook generator follows them on Bronze, Silver AND Gold. Keep in sync with
+    // specs/template.md (the static fallback used when the LLM is unavailable).
+    private const string GlobalSparkColumnRules = @"### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
+These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
+
+Rule A — No dotted alias strings.
+- Never pass dotted strings like ""c.customer_id"", ""ca.address_type"", ""h.sales_person"", or ""pc_child.name"" to F.col(...), withColumn(...), Window.partitionBy(...), Window.orderBy(...), or select(...). Spark treats ""c.customer_id"" as a single column literally named c.customer_id, which does not resolve once any projection or rename has been applied.
+- Alias scope (.alias(""c""), .alias(""ca""), ...) is only valid inside the SAME select / join expression that introduces it. Once you produce a new DataFrame via select(...) or withColumn(...), the dotted alias form is gone and you must reference plain column names.
+
+Rule B — Materialize helper columns before they are needed downstream.
+- For any column that will later be referenced by a Window, a withColumn, or a downstream join after a projection, first materialize it as a flat, unambiguous helper column (e.g. rank_customer_id, rank_address_type, sales_person_source) in the same select that introduces the join aliases.
+
+Rule C — Do not drop a column before its last consumer has run.
+- Before adding a withColumn, verify every F.col(...) referenced by that expression still exists on the DataFrame at that step. If a previous select(...) projection removed it, either:
+  - (preferred) move the withColumn BEFORE the projection that drops the source column, OR
+  - keep the source column in the projection, OR
+  - re-derive the value from a column that IS still present (often a boolean/flag that was computed earlier from the same source).
+- Example of the failure to avoid: dropping discontinued_date in a select(...) and then later writing F.when(F.col('discontinued_date').isNotNull(), ...) inside withColumn('is_sellable_currently', ...). The column is gone and Spark raises UNRESOLVED_COLUMN.
+- When a boolean flag derived from a raw column already exists on the DataFrame (e.g. is_discontinued derived from discontinued_date), prefer reusing the flag (F.col('is_discontinued')) over re-reading the dropped raw column.
+
+Rule D — Order of derived-column computations matters.
+- When building several derived columns where one depends on another (e.g. is_discontinued, then is_sellable_currently which uses is_discontinued), add them in dependency order with sequential withColumn calls, and reference the already-derived flag in the next expression — do NOT reach back to a raw source column that may have been dropped.
+
+Rule E — Validate schema between non-trivial transformation steps.
+- After any select(...) / drop(...) / heavy withColumn chain, and BEFORE the next step that depends on specific columns, assert those columns exist. Fail fast with an error message that names the missing column and the DataFrame variable, so the auto-fixer gets an actionable diagnostic instead of a deep analyzer stack trace.
+
+Rule F — Self-check pattern for every withColumn / Window.
+- For every withColumn(name, expr) and every Window definition, confirm: ""Every column referenced inside expr / inside the window's partitionBy / orderBy exists on the DataFrame at this exact point."" If not, fix per Rule C before generating the code.
+
+Rule G — Optional-column helpers must return typed Column nulls, not Python None.
+- When defining a helper like `_maybe(df, name)` that returns the column if it exists on the DataFrame and a fallback otherwise, NEVER return Python `None`. Spark functions (`F.coalesce`, `F.greatest`, `F.least`, `F.concat`, `F.when(...).otherwise(...)`, etc.) reject `None` arguments with `PySparkTypeError: [NOT_COLUMN_OR_STR]` and the cell crashes BEFORE any later fallback (e.g. `F.current_timestamp()`) gets a chance to satisfy the call.
+- Correct pattern — return a typed null literal as a Spark Column:
+  ```
+  def _maybe(df, name, dtype='timestamp'):
+      return F.col(name) if name in df.columns else F.lit(None).cast(dtype)
+  ```
+  Pick the `dtype` to match the surrounding expression (`'timestamp'` for date/time coalesces, `'string'` for text, `'double'` for numeric, etc.) so Spark can resolve the result type without ambiguity.
+- Alternative pattern (when the helper genuinely cannot know the dtype) — filter `None`s at the call site BEFORE invoking the Spark function:
+  ```
+  candidates = [c for c in (_maybe(df, 'modified_date'), _maybe(df, 'order_date')) if c is not None]
+  df = df.withColumn('source_dt', F.to_date(F.coalesce(*candidates, F.current_timestamp())))
+  ```
+  Either approach is acceptable, but **never pass Python `None` directly into a Spark function**.
+- Applies to ALL optional-column lookups across Bronze, Silver, Gold — including audit-timestamp coalesces, optional-key joins, fallback string formatting, etc. This is a layer-agnostic rule.
+";
+
     public NotebookBuilder(LlmService llm, IHttpClientFactory http, ILogger<NotebookBuilder> log)
     {
         _llm = llm; _http = http; _log = log;
@@ -268,6 +316,161 @@ Produce the JSON now.";
     }
 
     /// <summary>
+    /// Generates the cells for ONE layer's notebook given:
+    /// - the full spec markdown,
+    /// - the ACTUAL produced-table schemas from the prior layer (or the source-table schemas for bronze),
+    /// - the standard run parameters.
+    /// This is the per-layer replacement for `GenerateNotebooksFromSpecAsync`. It lets the LLM
+    /// write Spark code against real columns rather than guess what the previous layer produced.
+    /// Returns null on LLM failure; the caller must hard-fail in that case rather than silently
+    /// proceeding with hallucinated code.
+    /// </summary>
+    public async Task<List<string>?> GenerateLayerNotebookAsync(
+        string layer,
+        string specMarkdown,
+        string workspaceId, string sourceWorkspaceId, string sourceLakehouseId,
+        string targetLakehouseId, string targetLakehouseName,
+        List<string> sourceTables,
+        IReadOnlyDictionary<string, string> priorLayerSchemas,
+        string runId, string? model = null)
+    {
+        if (!_llm.Configured) return null;
+        layer = layer.Trim().ToLowerInvariant();
+        var allowed = new[] { "bronze", "silver", "gold", "reporting" };
+        if (!allowed.Contains(layer)) throw new ArgumentException($"unknown layer '{layer}'");
+
+        // Layer-specific responsibilities (kept compact so the prompt fits comfortably).
+        var layerSpec = layer switch
+        {
+            "bronze" => @"BRONZE notebook:
+- Loop over source_tables. For each: read from src_base/Tables/<table_relative_path> with spark.read.format('delta'), add metadata columns (ingestion_timestamp, source_path, batch_id=run_id, ingestion_date), write to f'{tgt_base}/Tables/bronze/<flat>' with mode='overwrite' option('overwriteSchema','true') partitioned by ingestion_date. flat = table_relative_path.split('/')[-1].lower().
+- Build a bronze_results dict {table: {rows, path}} and print the summary as JSON at the end.
+- Hard-fail (raise) on any per-table read or write error after calling _save_error('bronze', e).",
+            "silver" => @"SILVER notebook:
+- The 'prior_layer_schemas' provided in the user message tells you the EXACT columns currently sitting in the bronze schema. USE THEM — do not assume; do not invoke F.coalesce/F.greatest etc. with arguments that might be Python None (see Rule G in Generic guidance).
+- Loop over bronze tables. For each: read from f'{tgt_base}/Tables/bronze/<flat>', drop fully-null columns, trim strings, snake_case-rename columns (using a deterministic helper), dedupe on natural key (per spec), add ingestion_dt and source_dt audit columns (use F.lit(None).cast('timestamp') when the source columns are missing — never Python None), add _silver_ts = F.current_timestamp(), write to f'{tgt_base}/Tables/silver/<flat>' mode='overwrite' overwriteSchema=true. After write try OPTIMIZE inside try/except.
+- Build a silver_results dict and print the JSON summary.
+- Hard-fail (raise) on any error after _save_error('silver', e).",
+            "gold" => @"GOLD notebook:
+- The 'prior_layer_schemas' input describes the EXACT columns now present in silver. Build dims/facts using ONLY columns that appear there.
+- BEFORE any gold write, set: spark.conf.set('spark.sql.parquet.vorder.default','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.enabled','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.binSize','1g').
+- Read silver tables into a dict keyed by lowercased table name (read from f'{tgt_base}/Tables/silver/<name>').
+- Build the dims and facts described in the spec (e.g. dim_customer, dim_product, dim_sales, fact_sales). Always alias both sides of joins (`.alias('c').join(other.alias('ca'), c.customer_id == ca.customer_id, 'left')`). Write each to f'{tgt_base}/Tables/gold/<name>'.
+- Then run the data-quality tests described in the spec and APPEND rows to f'{tgt_base}/Tables/test/test_results'. Test rows schema: run_id STRING, test_name STRING, layer STRING, table_name STRING, status STRING (PASS/FAIL/ERROR), actual STRING, expected STRING, details STRING, checked_at TIMESTAMP. Use mode='append' option('mergeSchema','true').
+- Build a gold_results dict + a test_summary dict and print combined JSON summary.
+- Hard-fail (raise) on any error after _save_error('gold', e).",
+            "reporting" => @"REPORTING notebook (Power BI semantic model + report + Data Agent):
+- The 'prior_layer_schemas' input describes the EXACT columns currently sitting in gold (and test/test_results if discovered). Build TMSL columns from these — never from spec text alone.
+- import requests, base64, json, time, traceback. Get tok = notebookutils.credentials.getToken('pbi'). BASE_URL = f'https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}'.
+- Define a defensive _fabric_post(path, body) helper that returns None on non-2xx or caught exceptions. EVERY caller MUST do `if x is None: raise RuntimeError(...)` BEFORE `.get('id')`.
+- Item naming derived from target_lakehouse_name: '<name>_sm' (SemanticModel), '<name>_rpt' (Report), '<name>_agent' (AISkill).
+- 1) GET /lakehouses/{target_lakehouse_id} and poll until properties.sqlEndpointProperties.provisioningStatus == 'Success' (up to 5 min). Capture connectionString and the SQL endpoint id.
+- 2) POST /items to create a Direct Lake SemanticModel (TMSL model.bim, compatibilityLevel 1604) with tables for each discovered gold table (use the actual columns), relationships (per spec), explicit measures (per spec, PascalCase, with FORMAT strings). payloadType='InlineBase64', payload=base64(utf-8(json.dumps(tmsl_obj))), path='model.bim'.
+- 3) POST /items to create a Report (PBIR format) bound to the new SemanticModel id, with at least one page that uses the explicit measures.
+- 4) POST /items to create an AISkill data agent. Wrap in try/except so AISkill being preview-only never crashes the notebook.
+- 5) Print a final JSON summary line with semantic_model_id, report_id, data_agent_id (or null).
+- Hard-fail (raise) on the SemanticModel step's failure; reporting/agent steps may degrade gracefully.",
+            _ => throw new InvalidOperationException()
+        };
+
+        var system = $@"You are an expert Microsoft Fabric data engineer following the Microsoft Fabric e2e-medallion-architecture and powerbi-authoring-cli best practices. You generate the cells for ONE notebook (the {layer.ToUpperInvariant()} layer of a Bronze → Silver → Gold + reporting medallion).
+
+You are operating as the FabricDataEngineer agent (https://github.com/microsoft/skills-for-fabric/blob/main/agents/FabricDataEngineer.agent.md). Apply ALL of its core principles: decompose by endpoint-specific stage, parameterize, use Delta everywhere, idempotent overwrite patterns, validation gates, error-loud try/except.
+
+OUTPUT FORMAT (STRICT):
+Return ONLY a JSON object with this exact shape:
+{{
+  ""cells"": [""<cell1 source code>"", ""<cell2 source code>"", ...]
+}}
+No prose, no markdown fences. Each cell is a complete Python source string. The platform supplies a parameters cell (workspace_id, source_workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url) and a bootstrap cell defining src_base, tgt_base, source_tables, _save_error — DO NOT redefine these. Aim for 4-7 cells, ~80-120 lines total.
+
+CELL COMMENTING (REQUIRED):
+- Every cell MUST begin with a comment block:
+    # ---
+    # <one-line summary of the cell>
+    # <optional 1-2 extra lines explaining intent>
+- The actual Python code follows. Comments explain INTENT.
+
+PLATFORM CONSTRAINTS:
+- Spark abfss paths:
+    src_base = f""abfss://{{source_workspace_id}}@onelake.dfs.fabric.microsoft.com/{{source_lakehouse_id}}""
+    tgt_base = f""abfss://{{workspace_id}}@onelake.dfs.fabric.microsoft.com/{{target_lakehouse_id}}""
+- The TARGET lakehouse IS SCHEMA-ENABLED. Layer separator is the schema prefix: bronze/, silver/, gold/, test/.
+- Always use spark.read.format('delta').load(...) and DataFrame.write.format('delta')...save(...). NEVER saveAsTable.
+- Schemas (bronze/silver/gold/test) get auto-created on first write — do NOT issue CREATE SCHEMA.
+- Trust the notebook runtime identity for OneLake access. Never embed secrets.
+
+{layerSpec}
+
+CRITICAL — USE THE REAL PRIOR-LAYER SCHEMAS:
+The user message includes 'prior_layer_schemas' — a JSON-like list of {{ table: ""col:type, col:type, ..."" }}. These are the ACTUAL columns currently in the previous layer's Delta tables (or, for bronze, the source-lakehouse tables). The notebook you generate MUST:
+1. Use ONLY the columns listed there. If a column you would have referenced is missing, either: (a) skip it gracefully, (b) substitute a typed null literal (F.lit(None).cast('<type>')) — NEVER Python None passed into F.coalesce/F.greatest/F.least/F.when/F.concat/etc. (see Rule G in the spec's Generic guidance).
+2. Trust the schemas over any spec text that contradicts them. If the spec says ""dim_customer joins customeraddress on customer_id"" but the silver customeraddress schema lacks customer_id, write the join only if you can satisfy it with what's present, otherwise raise a clear error from a defensive assertion.
+3. Apply the cross-cutting rules from the spec's '## Generic guidance' section (especially the Rule A-G column-reference rules) to every transformation step.
+
+ROBUSTNESS:
+- Wrap each major step in try/except that calls _save_error('{layer}', e) and re-raises. Never swallow errors silently — failures must propagate so the auto-fixer gets an actionable traceback.
+- Defensive REST handling (reporting layer only): every helper returns None on failure, every caller checks `if x is None: raise` BEFORE `.get('id')`.
+
+Code size: aim for 4-7 cells, ~80-120 lines total. Return the JSON now.";
+
+        // Compact prior-layer schemas into a readable block. Limit to the first ~25 tables x 4KB
+        // worth so we don't blow the prompt budget on huge lakehouses.
+        var schemaBlock = priorLayerSchemas.Count == 0
+            ? "(none — this is bronze; the source tables are listed below)"
+            : string.Join("\n", priorLayerSchemas
+                .Take(40)
+                .Select(kv => $"- `{kv.Key}`: {kv.Value}"));
+
+        var user = $@"## Run parameters
+workspace_id = {workspaceId}
+source_workspace_id = {sourceWorkspaceId}
+source_lakehouse_id = {sourceLakehouseId}
+target_lakehouse_id = {targetLakehouseId}
+target_lakehouse_name = {targetLakehouseName}
+run_id = {runId}
+source_tables_csv = {string.Join(",", sourceTables)}
+
+## Prior-layer schemas (REAL columns currently present — trust over spec text)
+{schemaBlock}
+
+## Spec (markdown)
+{specMarkdown}
+
+Produce the JSON for the {layer} notebook now.";
+
+        string answer;
+        try { answer = await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.1, model: model, runId: runId); }
+        catch (Exception ex) { _log.LogWarning(ex, "LLM layer-cell-gen failed for {layer}", layer); return null; }
+
+        var json = ExtractJson(answer);
+        if (json is null)
+        {
+            _log.LogWarning("Could not find JSON in LLM response for {layer}. Raw preview: {preview}",
+                layer, answer.Length > 800 ? answer.Substring(0, 800) + "...(truncated)" : answer);
+            return null;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("cells", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                var list = ReadStringArray(arr);
+                if (list.Count > 0) return list;
+            }
+            // Be lenient: some models return { "<layer>": [...] } instead of { "cells": [...] }.
+            if (doc.RootElement.TryGetProperty(layer, out var arr2) && arr2.ValueKind == JsonValueKind.Array)
+            {
+                var list = ReadStringArray(arr2);
+                if (list.Count > 0) return list;
+            }
+            _log.LogWarning("LLM response for {layer} missing 'cells' array", layer);
+            return null;
+        }
+        catch (Exception ex) { _log.LogWarning(ex, "LLM JSON parse failed for {layer}", layer); return null; }
+    }
+
+    /// <summary>
     /// Generate an initial spec markdown tailored to the user's picked source tables.
     /// Returned markdown follows the canonical 5-section structure (Generic / Medallion /
     /// Semantic / Report / Data Agent) so the frontend can split it into the per-section editors.
@@ -277,7 +480,7 @@ Produce the JSON now.";
         IReadOnlyDictionary<string, string>? tableSchemas = null, string? model = null)
     {
         if (!_llm.Configured) return null;
-        var system = @"You are a senior Microsoft Fabric data architect. Given the user's selected source tables AND their actual column schemas, produce a complete medallion build spec. The output is shown to the user in 5 editable sections — keep that structure intact.
+        var system = $@"You are a senior Microsoft Fabric data architect. Given the user's selected source tables AND their actual column schemas, produce a complete medallion build spec. The output is shown to the user in 5 editable sections — keep that structure intact.
 
 CRITICAL: BASE YOUR PROPOSAL ON THE ACTUAL TABLE NAMES AND COLUMNS PROVIDED. Do NOT assume any specific source shape (AdventureWorksLT, Northwind, etc.) unless the actual table names and columns clearly match that shape. If they don't match a well-known pattern, propose dims/facts based on what you actually see: identify which tables look like facts (transactional, time-stamped, foreign-key heavy), which look like dimensions (small, master-data, descriptive), and which are junction tables. If multiple modeling routes are plausible, briefly describe each and ask the user to choose by editing the spec.
 
@@ -318,6 +521,10 @@ Apply these reference skills/agents at all times:
 
 THEN include the standard cross-cutting code rules: defensive column references, alias-prefixed joins after every join, groupBy/agg column existence assertion, defensive REST handling with `if x is None: raise` BEFORE `.get()`, no `saveAsTable`, parameter cells, idempotent overwrite patterns, error-loud try/except that calls `_save_error(layer, e)` and re-raises.
 
+THEN include the following ""Global Spark column-reference rules"" subsection VERBATIM (copy the entire block below into the Generic guidance section, preserving headings, bullets, and rule labels A–F exactly as written — do not paraphrase, abbreviate, or reorder):
+
+{GlobalSparkColumnRules}
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -347,15 +554,20 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 ```
 
 PROPOSAL RULES:
-- Use the ACTUAL column lists provided to make decisions. Do not invent columns.
+- Use the ACTUAL column lists provided to make join/PK/FK decisions. Do not invent columns.
 - If a table has obvious FK columns (e.g., 'customer_id' and the customer table exists), use it as a join key.
-- If a table has clear PK pattern (e.g., 'id', '{tablename}_id'), note it.
+- If a table has clear PK pattern (e.g., 'id', '{{tablename}}_id'), note it.
 - For each non-obvious modeling decision, mention alternatives in the spec so the user can edit.
 - Include standard data quality tests (row counts, no-null PKs, unique PKs, referential integrity for join keys you identified).
 - For the semantic model: propose ~4-6 explicit DAX measures appropriate to the data.
 - For the report: propose ~2-3 pages with concrete visual types tied to the measures.
 - For the Data Agent: write a role description, 6-10 starter questions matching the actual data domain, and tight guardrails.
-- Keep markdown clean. Aim for ~120-220 lines total.";
+- Keep markdown clean. Aim for ~120-220 lines total.
+
+INTENT OVER DETAILED COLUMN LISTS (IMPORTANT):
+- The build pipeline runs each layer's notebook ONE AT A TIME and inspects the ACTUAL produced tables between layers. The per-layer notebook generator receives the real column lists at runtime and is instructed to trust those over any spec text that contradicts them.
+- Therefore, the layer sections (Bronze/Silver/Gold/Semantic/Report) should describe INTENT and SHAPE — what tables to produce, what joins to perform, what measures to expose, what data-quality tests to run — NOT exhaustive column-by-column field listings. Naming specific business-meaningful columns is fine and helpful (e.g. ""include cleaned sales_person""), but do not try to enumerate every column of every table; that information becomes stale the moment the bronze rename happens and the LLM will rediscover it at runtime anyway.
+- Rule of thumb: if a sentence reads like a schema dump (""columns: id INT, name STRING, …""), trim it. If it reads like a design decision (""dedupe customer rows on customer_id, keeping the latest modified_date""), keep it.";
 
         var schemaSection = tableSchemas != null && tableSchemas.Count > 0
             ? string.Join("\n", sourceTables.Select(t =>
@@ -403,12 +615,19 @@ Rules:
 - Preserve the existing top-level structure exactly: the '# Run Spec ...' heading, '## Inputs', '## Generic guidance', '## Bronze', '## Silver', '## Gold', '## Semantic model', '## Report', '## Data Agent'. Do not delete the Inputs block.
 - ## Generic guidance: you MAY revise it (the user trusts the LLM here). If the failure exposes a new cross-cutting rule, add it. Keep the skill/agent URL list intact at the top.
 - Sharpen language in the relevant LAYER section (Bronze/Silver/Gold/Semantic/Report/DataAgent) that caused the failure (UNRESOLVED_COLUMN → name the column; AMBIGUOUS_REFERENCE → alias-prefix joins; missing junction-table column → name the real columns).
+- CROSS-TABLE ROOT-CAUSE ANALYSIS — REQUIRED: before writing the fix, list every source table referenced in the '## Inputs' section of the spec and ask yourself: ""Could this same root cause hit ANY of the other tables on the next run?"" Many failures (snake_case rename collisions, columns that disappear after a select(), ambiguous join keys, NULL handling, type coercion, missing columns on junction tables) are SYSTEMIC. If the root cause is plausibly systemic across multiple tables, do ONE of the following — never both:
+   (a) GENERALIZE — rewrite the relevant layer section with a single rule that defensively handles the issue for ALL tables (e.g. ""for every source table T, after the select() projection, assert column X exists; if absent, fall back to ...""). Prefer this when the rule is uniform.
+   (b) ENUMERATE — list each affected table by name with its specific fix, in a sub-bullet list under the failing layer's section. Prefer this when each table needs a different concrete change (e.g. different column names, different keys).
+  In your '## Updated specs' changelog entry, explicitly state which approach you took and why, AND list the other tables you considered (even if you decided they were not affected). This makes the analysis auditable.
+- CRITICAL — UPSTREAM PRESERVATION: if 'failed_layer' is provided, you MUST NOT modify any layer section UPSTREAM of it (those layers already succeeded and their Delta tables are still in the lakehouse — the next build will resume FROM the failed_layer, so any upstream edits would be silently ignored). Upstream order is: bronze → silver → gold → reporting (semantic/report/agent live inside reporting). If you truly believe the root cause is in an upstream layer, do not edit upstream sections; instead, tighten the failed_layer section to defensively handle the upstream shape (e.g. coerce types, alias columns, add guards). The Generic guidance section MAY still be revised — it is cross-cutting, not a layer.
 - Prepend a NEW section at the very top (between the '# Run Spec' line and '## Inputs') called '## Updated specs' that documents this change. Format:
   ```
   ## Updated specs
 
   ### Iteration <N> — <UTC timestamp> — failed layer: <layer> (run: <runId>)
   - **Root cause (1-line summary)**: <e.g. AMBIGUOUS_REFERENCE on 'customer_id' in dim_customer build>
+  - **Cross-table audit**: <list every other source table you considered and whether the same root cause could hit it (yes/no + 1-line reason each). E.g. ""customeraddress: yes — also has customer_id; salesorderheader: yes — same; address: no — no customer_id column.""
+  - **Fix approach**: <GENERALIZE or ENUMERATE — and why you chose it>
   - **What was changed**: <which section(s) you tightened and how, in 1-3 bullets>
   ```
   If a '## Updated specs' section already exists, KEEP its entries and APPEND a new '### Iteration ...' subsection underneath them (newest at the bottom).
@@ -492,13 +711,116 @@ The user just edited '## {Capitalize(editedSection)}'. Re-propose {downstreamLis
 
         try
         {
-            return await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.2, model: model, runId: runId);
+            var raw = await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.2, model: model, runId: runId);
+            if (string.IsNullOrWhiteSpace(raw)) return currentSpec;
+            // Defensive merge: never let a malformed LLM response wipe the user's editor.
+            // The LLM is supposed to return the full updated spec, but it sometimes truncates,
+            // wraps the answer in code fences, or only emits the downstream block. We:
+            //   1. Strip a single pair of leading/trailing ```...``` code fences if present.
+            //   2. Parse both `currentSpec` and the LLM response into sections.
+            //   3. For sections AT or UPSTREAM of the edited section → keep verbatim from currentSpec.
+            //   4. For downstream sections → take from the LLM response if non-empty; otherwise
+            //      fall back to currentSpec's existing version so the editor never goes blank.
+            // The recombined markdown always has all known sections, in canonical order.
+            return MergePropagatedSpec(currentSpec, raw, editedSection);
         }
         catch (Exception ex)
         {
             _log.LogWarning(ex, "PropagateDownstream LLM call failed");
-            return null;
+            return currentSpec;
         }
+    }
+
+    // Canonical section order for the spec markdown. Lowercase keys match the SECTION_PATTERNS in the frontend.
+    private static readonly (string Key, string Heading)[] SpecSections = new[]
+    {
+        ("generic", "## Generic guidance"),
+        ("bronze", "## Bronze"),
+        ("silver", "## Silver"),
+        ("gold", "## Gold"),
+        ("semantic", "## Semantic model"),
+        ("report", "## Report"),
+        ("agent", "## Data Agent"),
+    };
+
+    // Strip a single pair of leading/trailing fenced code blocks (```...```) wrapping the whole text.
+    private static string StripOuterCodeFences(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return s;
+        var trimmed = s.Trim();
+        var m = Regex.Match(trimmed, @"^```[A-Za-z0-9_-]*\s*\r?\n(?<body>[\s\S]*?)\r?\n```\s*$");
+        return m.Success ? m.Groups["body"].Value : s;
+    }
+
+    // Split a spec into (header, sectionMap) by H2 headings. 'header' is everything before the
+    // first known section heading (preserves '# Run Spec', '## Updated specs', '## Inputs').
+    private static (string header, Dictionary<string, string> sections) SplitSpec(string spec)
+    {
+        var sections = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, _) in SpecSections) sections[k] = "";
+        if (string.IsNullOrWhiteSpace(spec)) return ("", sections);
+
+        var headingRx = new Dictionary<string, Regex>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, h) in SpecSections)
+            headingRx[k] = new Regex("^" + Regex.Escape(h) + @"\s*$", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+
+        var lines = spec.Split('\n');
+        var slots = new List<(int line, string key)>();
+        for (int i = 0; i < lines.Length; i++)
+        {
+            foreach (var (k, rx) in headingRx)
+                if (rx.IsMatch(lines[i])) slots.Add((i, k));
+        }
+        slots.Sort((a, b) => a.line.CompareTo(b.line));
+        if (slots.Count == 0) return (spec.TrimEnd(), sections);
+
+        var header = string.Join('\n', lines, 0, slots[0].line).TrimEnd();
+        for (int i = 0; i < slots.Count; i++)
+        {
+            var start = slots[i].line;
+            var end = i + 1 < slots.Count ? slots[i + 1].line : lines.Length;
+            sections[slots[i].key] = string.Join('\n', lines, start, end - start).TrimEnd();
+        }
+        return (header, sections);
+    }
+
+    private static string MergePropagatedSpec(string currentSpec, string llmResponse, string editedSection)
+    {
+        var cleaned = StripOuterCodeFences(llmResponse);
+        var (curHeader, curSections) = SplitSpec(currentSpec);
+        var (newHeader, newSections) = SplitSpec(cleaned);
+
+        // editedSection determines the boundary. Sections AT or BEFORE this index are preserved
+        // from the current spec; sections AFTER are taken from the LLM response (with fallback).
+        var orderKeys = SpecSections.Select(x => x.Key).ToArray();
+        // Map 'generic' edit → editedIdx = 0 ; 'agent' → last. Unknown → -1 (defensive: keep all current).
+        int editedIdx = Array.FindIndex(orderKeys, k => string.Equals(k, editedSection, StringComparison.OrdinalIgnoreCase));
+
+        var merged = new Dictionary<string, string>(curSections, StringComparer.OrdinalIgnoreCase);
+        if (editedIdx >= 0)
+        {
+            for (int i = editedIdx + 1; i < orderKeys.Length; i++)
+            {
+                var k = orderKeys[i];
+                var fromLlm = newSections.TryGetValue(k, out var v) ? v : "";
+                merged[k] = !string.IsNullOrWhiteSpace(fromLlm) ? fromLlm : curSections[k];
+            }
+        }
+
+        // Recombine using the CURRENT spec's header (we never let the LLM rewrite the # Run Spec /
+        // ## Updated specs / ## Inputs block, even if it tried).
+        var sb = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(curHeader)) sb.AppendLine(curHeader).AppendLine();
+        foreach (var (k, _) in SpecSections)
+        {
+            var body = merged[k];
+            if (!string.IsNullOrWhiteSpace(body))
+            {
+                sb.AppendLine(body.TrimEnd());
+                sb.AppendLine();
+            }
+        }
+        return sb.ToString().TrimEnd() + "\n";
     }
 
     private static string Capitalize(string s) => string.IsNullOrEmpty(s) ? s : char.ToUpper(s[0]) + s.Substring(1);

@@ -155,6 +155,99 @@ public class FabricService
     }
 
     /// <summary>
+    /// Lists Delta tables sitting under a given schema prefix (e.g. "bronze", "silver", "gold")
+    /// in the target lakehouse, then fetches each one's current schema. Designed to be called
+    /// AFTER a layer's Spark job completes so the next layer's LLM generation can see the real
+    /// columns rather than guess them.
+    ///
+    /// OneLake DFS occasionally lags a few seconds behind a just-finished Spark write —
+    /// so we retry the list call up to `maxRetries` times with exponential-ish backoff.
+    /// Schema reads are themselves cheap (single GET per table) and are NOT retried separately;
+    /// if a particular table's _delta_log isn't yet readable, we return null for that table and
+    /// the caller can decide whether to retry the whole discovery or hard-fail.
+    /// </summary>
+    /// <returns>Dictionary keyed by relative table path (e.g. "silver/customer") → schema summary string ("col:type, col:type"). Empty if discovery failed.</returns>
+    public async Task<Dictionary<string, string>> DiscoverLayerTablesAsync(
+        string workspaceId, string lakehouseId, string schemaPrefix,
+        int maxRetries = 6, int initialDelayMs = 2000)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var prefix = schemaPrefix.TrimEnd('/') + "/";
+        var tok = await GetServiceStorageTokenAsync();
+        var hc = _http.CreateClient();
+        hc.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tok);
+
+        List<string> tables = new();
+        var delay = initialDelayMs;
+        for (int attempt = 0; attempt < maxRetries; attempt++)
+        {
+            try
+            {
+                var url = $"https://onelake.dfs.fabric.microsoft.com/{workspaceId}/{lakehouseId}/?resource=filesystem&recursive=true&directory=Tables/{schemaPrefix.TrimEnd('/')}";
+                var resp = await hc.GetAsync(url);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var raw = await resp.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(raw);
+                    if (doc.RootElement.TryGetProperty("paths", out var paths))
+                    {
+                        // Path entries look like 'Tables/silver/customer/_delta_log'; we take the
+                        // segment between the schema prefix and '/_delta_log' as the table name.
+                        var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var p in paths.EnumerateArray())
+                        {
+                            var name = p.TryGetProperty("name", out var nm) ? nm.GetString() ?? "" : "";
+                            if (!name.EndsWith("/_delta_log")) continue;
+                            var tableRoot = name[..^"/_delta_log".Length];
+                            var marker = $"Tables/{prefix}";
+                            var idx = tableRoot.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                            if (idx < 0) continue;
+                            var rel = tableRoot.Substring(idx + "Tables/".Length); // 'silver/customer'
+                            found.Add(rel);
+                        }
+                        tables = found.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+                        break;
+                    }
+                }
+                _log.LogDebug("DiscoverLayerTablesAsync attempt {a} got {s} for ws={ws} lh={lh} prefix={p}",
+                    attempt + 1, resp.StatusCode, workspaceId, lakehouseId, schemaPrefix);
+            }
+            catch (Exception ex)
+            {
+                _log.LogDebug(ex, "DiscoverLayerTablesAsync attempt {a} threw", attempt + 1);
+            }
+            await Task.Delay(delay);
+            delay = Math.Min(delay * 2, 30_000);
+        }
+
+        // Fetch schemas for each discovered table. We pass userStorageToken = null so the schema
+        // reader uses the same MI-backed token path.
+        foreach (var t in tables)
+        {
+            var schema = await GetTableSchemaSummaryAsync(workspaceId, lakehouseId, t);
+            if (!string.IsNullOrEmpty(schema)) result[t] = schema;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Reads schemas for an explicit list of source tables (e.g. the user-picked ingestion list).
+    /// Used to seed the bronze layer's LLM prompt with real source-table column lists.
+    /// </summary>
+    public async Task<Dictionary<string, string>> GetSchemasForTablesAsync(
+        string workspaceId, string lakehouseId, IEnumerable<string> tableRelativePaths,
+        string? userStorageToken = null)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in tableRelativePaths)
+        {
+            var schema = await GetTableSchemaSummaryAsync(workspaceId, lakehouseId, t, userStorageToken);
+            if (!string.IsNullOrEmpty(schema)) result[t] = schema;
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Fetches a small text file from a target lakehouse's Files/ area via the OneLake DFS data plane.
     /// Used to surface the notebook's persisted error trace back to the web UI.
     /// </summary>
@@ -180,9 +273,13 @@ public class FabricService
     }
 
     /// <summary>
-    /// Reads a Delta table's schema from its _delta_log/00000000000000000000.json metaData action.
-    /// Prefers a caller-supplied storage token (the user's, which usually has access to any workspace
-    /// they're a member of); falls back to the App Service MI token.
+    /// Reads a Delta table's CURRENT schema by scanning _delta_log/ for the most recent
+    /// metaData action. Reading only commit 00000000000000000000.json (the table-creation
+    /// commit) would return stale schemas for tables that have been overwritten with
+    /// schema evolution since creation — which is exactly the case in the medallion
+    /// pipeline where bronze/silver/gold tables get overwritten on each rebuild.
+    /// Prefers a caller-supplied storage token (the user's, which usually has access to any
+    /// workspace they're a member of); falls back to the App Service MI token.
     /// </summary>
     public async Task<string?> GetTableSchemaSummaryAsync(string workspaceId, string lakehouseId, string tableRelativePath, string? userStorageToken = null)
     {
@@ -193,24 +290,56 @@ public class FabricService
                 : await GetServiceStorageTokenAsync();
             var hc = _http.CreateClient();
             hc.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tok);
-            var url = $"https://onelake.dfs.fabric.microsoft.com/{workspaceId}/{lakehouseId}/Tables/{tableRelativePath}/_delta_log/00000000000000000000.json";
-            var resp = await hc.GetAsync(url);
-            if (!resp.IsSuccessStatusCode) return null;
-            var raw = await resp.Content.ReadAsStringAsync();
-            string? schemaJson = null;
-            foreach (var line in raw.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+
+            // 1) List all _delta_log/*.json commit files for this table.
+            var logBase = $"https://onelake.dfs.fabric.microsoft.com/{workspaceId}/{lakehouseId}/Tables/{tableRelativePath}/_delta_log";
+            var listUrl = $"https://onelake.dfs.fabric.microsoft.com/{workspaceId}?resource=filesystem&recursive=false&directory={lakehouseId}/Tables/{tableRelativePath}/_delta_log";
+            var listResp = await hc.GetAsync(listUrl);
+            var commits = new List<long>();
+            if (listResp.IsSuccessStatusCode)
             {
-                try
+                var listRaw = await listResp.Content.ReadAsStringAsync();
+                using var listDoc = JsonDocument.Parse(listRaw);
+                if (listDoc.RootElement.TryGetProperty("paths", out var pathsEl))
                 {
-                    using var doc = JsonDocument.Parse(line);
-                    if (doc.RootElement.TryGetProperty("metaData", out var md)
-                        && md.TryGetProperty("schemaString", out var ss))
+                    foreach (var p in pathsEl.EnumerateArray())
                     {
-                        schemaJson = ss.GetString();
-                        break;
+                        var name = p.TryGetProperty("name", out var nm) ? nm.GetString() ?? "" : "";
+                        // name looks like 'lakehouseId/Tables/<rel>/_delta_log/00000000000000000003.json'
+                        var fname = name.Split('/').LastOrDefault() ?? "";
+                        if (fname.EndsWith(".json") && long.TryParse(fname[..^5].TrimStart('0').Length == 0 ? "0" : fname[..^5].TrimStart('0'), out var v))
+                            commits.Add(v);
                     }
                 }
-                catch { /* skip invalid lines */ }
+            }
+            // Fallback: assume only commit 0 exists if the directory listing failed.
+            if (commits.Count == 0) commits.Add(0);
+            commits.Sort();
+            commits.Reverse(); // newest first
+
+            // 2) Walk from newest to oldest, looking for the most recent metaData.schemaString.
+            string? schemaJson = null;
+            foreach (var v in commits)
+            {
+                var commitUrl = $"{logBase}/{v.ToString("D20")}.json";
+                var resp = await hc.GetAsync(commitUrl);
+                if (!resp.IsSuccessStatusCode) continue;
+                var raw = await resp.Content.ReadAsStringAsync();
+                foreach (var line in raw.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(line);
+                        if (doc.RootElement.TryGetProperty("metaData", out var md)
+                            && md.TryGetProperty("schemaString", out var ss))
+                        {
+                            schemaJson = ss.GetString();
+                            break;
+                        }
+                    }
+                    catch { /* skip invalid lines */ }
+                }
+                if (schemaJson != null) break;
             }
             if (string.IsNullOrEmpty(schemaJson)) return null;
             using var sdoc = JsonDocument.Parse(schemaJson);

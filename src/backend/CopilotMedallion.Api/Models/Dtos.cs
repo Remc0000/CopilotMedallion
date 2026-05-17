@@ -19,7 +19,7 @@ public record PreviewSpecsResponse(string Markdown, string RunId, string TargetL
 
 public record GenerateSpecsResponse(string RunId, string Branch, string SpecUrl);
 
-public record BuildRequest(string RunId, string? Model = null);
+public record BuildRequest(string RunId, string? Model = null, string? StartFromLayer = null);
 public record FixSpecRequest(string CurrentSpec, string ErrorTrace, string? Model = null, int? Iteration = null, string? FailedLayer = null);
 public record PropagateSpecRequest(string CurrentSpec, string EditedSection, string? Model = null);
 

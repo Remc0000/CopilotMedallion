@@ -69,6 +69,31 @@ function joinSpec(parts: { header: string; generic: string; bronze: string; silv
   return [parts.header, parts.generic, parts.bronze, parts.silver, parts.gold, parts.semantic, parts.report, parts.agent].filter(s => s && s.length).join('\n\n').trim() + '\n'
 }
 
+// Layers the backend actually executes, in build order.
+type BuildLayer = 'bronze' | 'silver' | 'gold' | 'reporting'
+const BUILD_LAYERS: BuildLayer[] = ['bronze', 'silver', 'gold', 'reporting']
+
+// Determine the earliest build layer whose spec content differs between the previous
+// and revised spec. Sections semantic/report/agent are folded into 'reporting' (they
+// are all consumed by the reporting notebook). Returns null if nothing relevant changed.
+function earliestChangedLayer(oldSpec: string, newSpec: string): BuildLayer | null {
+  const o = splitSpec(oldSpec)
+  const n = splitSpec(newSpec)
+  const norm = (s: string) => (s ?? '').trim()
+  if (norm(o.bronze) !== norm(n.bronze)) return 'bronze'
+  if (norm(o.silver) !== norm(n.silver)) return 'silver'
+  if (norm(o.gold) !== norm(n.gold)) return 'gold'
+  if (norm(o.semantic) !== norm(n.semantic) ||
+      norm(o.report) !== norm(n.report) ||
+      norm(o.agent) !== norm(n.agent)) return 'reporting'
+  return null
+}
+
+// Pick the earlier of two layers in build order (bronze < silver < gold < reporting).
+function earlierLayer(a: BuildLayer, b: BuildLayer): BuildLayer {
+  return BUILD_LAYERS.indexOf(a) <= BUILD_LAYERS.indexOf(b) ? a : b
+}
+
 function signatureFromTrace(trace: string): string {
   // Strip volatile bits (run IDs, timestamps, line numbers, memory addresses, GUIDs) so
   // two traces from "the same root cause" compare equal.
@@ -615,7 +640,12 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       }
       setSpecDraft(resp.markdown)
       setPreviewRunId(resp.runId)
-      if (!targetName) setTargetName(resp.targetLakehouseName)
+      // Don't auto-populate the user-visible lakehouse-name input from the preview response.
+      // The user might still type a name; we resolve the final name at BUILD time (not at preview),
+      // so the input box stays under the user's control. The spec markdown returned by preview
+      // does embed an auto-generated placeholder in its '## Inputs' section — when /api/specs is
+      // called at build time it will rewrite that line to reflect the actually-chosen name.
+      // setTargetName(resp.targetLakehouseName)  // intentionally not called
     } catch (e: any) {
       if (proposeIntentRef.current === intent) setError(String(e))
     }
@@ -710,7 +740,29 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         method: 'POST',
         body: JSON.stringify({ currentSpec: combined, editedSection: editedSectionKey, model: selectedModel })
       })
-      if (r.markdown) setSpecDraft(r.markdown)
+      if (!r.markdown) return
+      // Defensive client-side merge — never trust the server response to fully overwrite the
+      // editor. Keep the user's edited section + everything UPSTREAM verbatim from local state;
+      // only replace the downstream sections from the response, with a fallback to the current
+      // local value if a section is missing in the response. This guarantees the editor cannot
+      // go blank even if the backend or LLM returns a malformed/partial response.
+      const orderKeys = ['generic','bronze','silver','gold','semantic','report','agent'] as const
+      const editedIdx = orderKeys.indexOf(editedSectionKey as typeof orderKeys[number])
+      const llmParts = splitSpec(r.markdown)
+      const local = { header: specHeader, generic: specGeneric, bronze: specBronze, silver: specSilver, gold: specGold, semantic: specSemantic, report: specReport, agent: specAgent }
+      const merged: typeof local = { ...local }
+      if (editedIdx >= 0) {
+        for (let i = editedIdx + 1; i < orderKeys.length; i++) {
+          const k = orderKeys[i] as keyof typeof local
+          const fromLlm = (llmParts as any)[k] as string
+          if (typeof fromLlm === 'string' && fromLlm.trim().length > 0) {
+            merged[k] = fromLlm
+          }
+          // else: keep local[k] — never wipe.
+        }
+      }
+      const recombined = joinSpec(merged)
+      setSpecDraft(recombined)
     } catch (e: any) { setError(`Propagate downstream failed: ${String(e)}`) }
     finally { setBusy(false); setBusyMsg('') }
   }
@@ -755,6 +807,22 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     if (!fixResp.markdown) throw new Error('No revised spec returned from the LLM.')
     setSpecDraft(fixResp.markdown)
 
+    // Decide where to resume the build. The failed layer is the natural starting point —
+    // upstream layers already produced valid Delta tables. BUT: if the LLM actually changed
+    // any upstream layer section (despite the prompt rule), we have to redo that layer (and
+    // everything below it) for the spec change to take effect. So pick the EARLIER of:
+    //   (a) the failed layer (from the previous run)
+    //   (b) the earliest layer whose section text differs between old and new spec
+    // If neither yields a layer, fall back to a full bronze rebuild for safety.
+    const failedLayer = (BUILD_LAYERS as readonly string[]).includes(run.currentLayer ?? '')
+      ? (run.currentLayer as BuildLayer)
+      : null
+    const changedLayer = earliestChangedLayer(combined, fixResp.markdown)
+    let startFromLayer: BuildLayer = 'bronze'
+    if (failedLayer && changedLayer) startFromLayer = earlierLayer(failedLayer, changedLayer)
+    else if (failedLayer) startFromLayer = failedLayer
+    else if (changedLayer) startFromLayer = changedLayer
+
     setBusyMsg(`Iteration ${currentIteration + 1}/${maxIterations}: pushing updated spec...`)
     await api<SpecResponse>('/api/specs', fabric, {
       method: 'POST',
@@ -769,10 +837,10 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       })
     })
 
-    setBusyMsg(`Iteration ${currentIteration + 1}/${maxIterations}: rebuilding...`)
+    setBusyMsg(`Iteration ${currentIteration + 1}/${maxIterations}: rebuilding from ${startFromLayer}...`)
     const r = await api<Run>('/api/build', fabric, {
       method: 'POST',
-      body: JSON.stringify({ runId: run.runId, model: selectedModel })
+      body: JSON.stringify({ runId: run.runId, model: selectedModel, startFromLayer })
     })
     setSparkError(null)
     setCurrentIteration(currentIteration + 1)
@@ -1049,7 +1117,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           ) : (
             <div className={s.row}>
               <Label htmlFor="tn">Target Lakehouse name (creates new)</Label>
-              <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(auto-generated)" disabled={!!run} />
+              <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(leave empty — auto-generated when you click Build)" disabled={!!run} />
             </div>
           )}
         </Card>
@@ -1192,6 +1260,31 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               )
             })()}
           />
+          {/* Top action row — mirrors the buttons at the bottom of the failure MessageBar so they're
+              always reachable. In the embedded Fabric inner-iframe, the bottom of the card can be
+              clipped by the host scroll container, so users may not see/click them. */}
+          {(run.status === 'Failed' || run.status === 'Cancelled') && run.workspaceId && (
+            <div className={s.row} style={{ marginBottom: 8 }}>
+              {(() => {
+                const layerNb = run.currentLayer === 'gold' ? run.goldNotebookId
+                              : run.currentLayer === 'silver' ? run.silverNotebookId
+                              : run.currentLayer === 'bronze' ? run.bronzeNotebookId
+                              : run.currentLayer === 'reporting' ? run.reportingNotebookId
+                              : (run.reportingNotebookId ?? run.goldNotebookId ?? run.silverNotebookId ?? run.bronzeNotebookId)
+                return layerNb && (
+                  <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/synapsenotebooks/${layerNb}`) }}>
+                    Open failed {run.currentLayer ?? ''} notebook
+                  </Button>
+                )
+              })()}
+              <Button as="a" href={`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal(`https://app.fabric.microsoft.com/groups/${run.workspaceId}/list?experience=power-bi`) }}>
+                Open Workspace
+              </Button>
+              <Button as="a" href={'https://app.fabric.microsoft.com/monitoringhub?experience=power-bi'} target="_blank" rel="noopener noreferrer" onClick={() => { if (window.parent !== window) openExternal('https://app.fabric.microsoft.com/monitoringhub?experience=power-bi') }}>
+                Open Monitoring Hub
+              </Button>
+            </div>
+          )}
           <div className={s.status}>
             <div>Run: <code>{run.runId}</code></div>
             <div>Target Lakehouse: <strong>{run.targetLakehouseName ?? '(pending)'}</strong></div>

@@ -197,17 +197,32 @@ public static class ApiEndpoints
                       ?? await fabric.FindLakehouseByIdAsync(tok, body.SourceLakehouseId, srcWs);
             if (src is null) return Results.NotFound("source lakehouse not accessible");
 
-            // If reusing an existing run, keep its id + target name + branch.
+            // If reusing an existing run, keep its id + branch.
+            // The lakehouse name resolution prefers an explicit, non-empty body.TargetLakehouseName
+            // so the user can rename right up until the first build creates the lakehouse. After that,
+            // the existing run's name is the source of truth (the lakehouse has already been created
+            // and we don't want a rename click to silently fork into a second lakehouse).
             RunInfo? existing = string.IsNullOrEmpty(body.ExistingRunId) ? null : await store.GetAsync(body.ExistingRunId);
             var runId = existing?.RunId ?? $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("n").Substring(0,6)}";
-            var targetName = existing?.TargetLakehouseName
-                ?? (string.IsNullOrWhiteSpace(body.TargetLakehouseName)
-                    ? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}"
-                    : body.TargetLakehouseName!);
+            var userProvidedName = !string.IsNullOrWhiteSpace(body.TargetLakehouseName) ? body.TargetLakehouseName!.Trim() : null;
+            var lakehouseAlreadyCreated = !string.IsNullOrEmpty(existing?.TargetLakehouseId);
+            var targetName = lakehouseAlreadyCreated
+                ? existing!.TargetLakehouseName!  // post-creation: lock in the existing name
+                : (userProvidedName
+                    ?? existing?.TargetLakehouseName
+                    ?? $"CopilotMedallion_{runId.Substring(0,15).Replace("-","_")}");
 
             var spec = string.IsNullOrWhiteSpace(body.SpecMarkdown)
                 ? gen.Generate(runId, src, body.Tables, targetName, ws)
                 : body.SpecMarkdown!;
+
+            // Make sure the '## Inputs' section's lakehouse line matches the name we're actually
+            // going to create — otherwise spec.md uploaded to OneLake would mislead the LLM
+            // (and the user reading it) about which lakehouse this run targets.
+            spec = System.Text.RegularExpressions.Regex.Replace(
+                spec,
+                @"(?m)^(- Target Lakehouse:\s*\*\*)[^*]+(\*\*.*)$",
+                $"$1{targetName}$2");
 
             // Always persist the spec markdown in our runs DB — this is now the canonical store.
             // GitHub push is optional/best-effort for human-readable history.
@@ -290,9 +305,44 @@ public static class ApiEndpoints
 
             var ws = !string.IsNullOrWhiteSpace(run.WorkspaceId) ? run.WorkspaceId : fabric.ResolveWorkspaceId(Ws(req));
 
+            // Resolve the layer we start the build chain from. Default is "bronze" (full rebuild).
+            // The auto-fix loop passes the previously failed layer so we can resume from there instead
+            // of redoing already-successful upstream layers (preserving their Delta tables in place).
+            // Guardrails: must be a known layer name; for any non-bronze resume the lakehouse + all
+            // upstream notebook IDs must already exist on the run (proving upstream layers succeeded
+            // on a prior run). Otherwise we silently downgrade to "bronze" and log.
+            var allLayers = new[] { "bronze", "silver", "gold", "reporting" };
+            var startFromLayer = (body.StartFromLayer ?? "bronze").Trim().ToLowerInvariant();
+            if (!allLayers.Contains(startFromLayer))
+                return Results.BadRequest(new { error = $"startFromLayer must be one of: {string.Join(", ", allLayers)}" });
+
+            var bgLogger0 = lf.CreateLogger("BuildJob");
+            if (startFromLayer != "bronze")
+            {
+                var startIdx0 = Array.IndexOf(allLayers, startFromLayer);
+                var upstreamNb = new Func<string, string?>(l => l switch
+                {
+                    "bronze" => run.BronzeNotebookId,
+                    "silver" => run.SilverNotebookId,
+                    "gold"   => run.GoldNotebookId,
+                    "reporting" => run.ReportingNotebookId,
+                    _ => null
+                });
+                var missing = allLayers.Take(startIdx0)
+                    .Where(l => string.IsNullOrEmpty(upstreamNb(l)))
+                    .ToList();
+                if (string.IsNullOrEmpty(run.TargetLakehouseId) || missing.Count > 0)
+                {
+                    bgLogger0.LogWarning("Run {r}: cannot resume from '{l}' (lakehouse={lh}, missing upstream={u}); falling back to 'bronze' full rebuild",
+                        run.RunId, startFromLayer, run.TargetLakehouseId ?? "(none)", string.Join(",", missing));
+                    startFromLayer = "bronze";
+                }
+            }
+            var startIdx = Array.IndexOf(allLayers, startFromLayer);
+
             await store.UpdateStatusAsync(run.RunId, "Queued");
 
-            var bgLogger = lf.CreateLogger("BuildJob");
+            var bgLogger = bgLogger0;
             _ = Task.Run(async () =>
             {
                 try
@@ -340,9 +390,12 @@ public static class ApiEndpoints
                     // a known lakehouse to read error.txt from (the auto-fix loop and UI depend on this).
                     await store.UpdateBuildAsync(run.RunId, targetLakehouseId, null, null);
 
-                    // When reusing, clear Tables/ (NOT Files/) so stale tables from a previous spec
-                    // don't pollute the new build. Files/ is preserved (spec.txt, error.txt, etc.).
-                    if (reusedExisting)
+                    // When reusing AND starting from bronze, clear Tables/ so stale tables from a previous
+                    // spec don't pollute the new build. For a resume-from-{silver|gold|reporting} we must
+                    // NOT clear, otherwise we'd destroy the upstream layers' Delta tables we're resuming on.
+                    // The per-layer notebooks themselves use mode='overwrite' so their own outputs are
+                    // idempotent on rerun.
+                    if (reusedExisting && startFromLayer == "bronze")
                     {
                         try
                         {
@@ -354,6 +407,11 @@ public static class ApiEndpoints
                             bgLogger.LogWarning(ex, "Run {r}: could not clear Tables/; the build will overwrite per-table", run.RunId);
                         }
                     }
+                    else if (reusedExisting)
+                    {
+                        bgLogger.LogInformation("Run {r}: resuming from '{l}' — keeping existing Tables/ intact",
+                            run.RunId, startFromLayer);
+                    }
 
                     await store.UpdateStatusAsync(run.RunId, "GeneratingNotebook");
                     // Spec is now stored directly in the runs DB (canonical) — fall back to GitHub for
@@ -364,33 +422,23 @@ public static class ApiEndpoints
                         var rawUrl = ToRawUrl(run.SpecUrl);
                         spec = await builder.FetchSpecMarkdownAsync(rawUrl);
                     }
+                    if (string.IsNullOrWhiteSpace(spec))
+                    {
+                        throw new Exception("No spec markdown found for this run; cannot generate notebooks.");
+                    }
                     var tables = (run.TablesCsv ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries).ToList();
 
                     // Persist the spec to OneLake Files/spec.md so the lakehouse is self-documenting.
-                    if (!string.IsNullOrEmpty(spec))
+                    try
                     {
-                        try
-                        {
-                            await fabric.UploadFileToLakehouseAsync(ws, targetLakehouseId,
-                                "Files/spec.md", spec, "text/markdown; charset=utf-8");
-                            bgLogger.LogInformation("Run {r}: wrote spec.md to lakehouse Files/", run.RunId);
-                        }
-                        catch (Exception ex)
-                        {
-                            bgLogger.LogWarning(ex, "Run {r}: could not write spec.md to lakehouse", run.RunId);
-                        }
+                        await fabric.UploadFileToLakehouseAsync(ws, targetLakehouseId,
+                            "Files/spec.md", spec, "text/markdown; charset=utf-8");
+                        bgLogger.LogInformation("Run {r}: wrote spec.md to lakehouse Files/", run.RunId);
                     }
-
-                    // Ask the LLM for per-layer cell lists.
-                    var perLayer = spec is null ? null : await builder.GenerateNotebooksFromSpecAsync(
-                        spec, ws, run.SourceLakehouseId ?? "", targetLakehouseId,
-                        run.TargetLakehouseName!, tables, run.RunId, body.Model);
-                    if (perLayer is null || perLayer.Count == 0)
+                    catch (Exception ex)
                     {
-                        throw new Exception("LLM did not return any notebook cells. Check the spec and try again.");
+                        bgLogger.LogWarning(ex, "Run {r}: could not write spec.md to lakehouse", run.RunId);
                     }
-                    bgLogger.LogInformation("Run {r}: LLM produced {n} notebooks ({layers})",
-                        run.RunId, perLayer.Count, string.Join(",", perLayer.Keys));
 
                     var srcWsForRun = !string.IsNullOrWhiteSpace(run.SourceWorkspaceId) ? run.SourceWorkspaceId! : ws;
                     var parameters = new Dictionary<string, object>
@@ -405,13 +453,98 @@ public static class ApiEndpoints
                         ["spec_url"] = new { value = run.SpecUrl ?? "", type = "string" }
                     };
 
-                    // Run each layer's notebook sequentially: deploy → run → poll until complete.
-                    foreach (var layer in new[] { "bronze", "silver", "gold", "reporting" })
+                    // Per-layer generation flow. For each layer to be executed:
+                    //   1. Discover the prior layer's ACTUAL produced tables + schemas.
+                    //   2. Ask the LLM to generate THIS layer's cells, with the real schemas injected.
+                    //   3. Deploy + run + poll. Hard-fail on Spark error or empty cell list.
+                    // This is the key change vs the old "one big LLM call up-front" flow: every layer's
+                    // notebook is grounded in the actual columns its predecessor produced, so the LLM
+                    // can't hallucinate column names that don't exist.
+                    // Resume-from-failed-layer still works: layers earlier than startIdx are skipped
+                    // entirely (no generation, no deploy, no run); their Delta tables are still in place
+                    // and will be discovered as the prior layer for the first layer we DO run.
+                    var priorLayerForSchemas = new Dictionary<string, string> {
+                        ["bronze"]    = "source",   // 'source' means: use source lakehouse + user-picked tables
+                        ["silver"]    = "bronze",
+                        ["gold"]      = "silver",
+                        ["reporting"] = "gold"
+                    };
+
+                    for (int li = 0; li < allLayers.Length; li++)
                     {
-                        if (!perLayer.TryGetValue(layer, out var layerCells) || layerCells.Count == 0)
+                        var layer = allLayers[li];
+                        if (li < startIdx)
                         {
-                            bgLogger.LogWarning("Run {r}: no cells for layer {l} — skipping", run.RunId, layer);
+                            bgLogger.LogInformation("Run {r}: skipping {layer} (resuming from {start})",
+                                run.RunId, layer, startFromLayer);
                             continue;
+                        }
+
+                        // ---- 1. Schema discovery for the prior layer ----
+                        var priorSrc = priorLayerForSchemas[layer];
+                        Dictionary<string, string> priorSchemas;
+                        if (priorSrc == "source")
+                        {
+                            // Bronze case: read the source lakehouse's user-picked tables.
+                            await store.UpdateStatusAsync(run.RunId, "DiscoveringSourceSchemas");
+                            try
+                            {
+                                priorSchemas = await fabric.GetSchemasForTablesAsync(
+                                    srcWsForRun, run.SourceLakehouseId ?? "", tables);
+                            }
+                            catch (Exception dEx)
+                            {
+                                bgLogger.LogWarning(dEx, "Run {r}: source schema discovery failed; proceeding with table names only", run.RunId);
+                                priorSchemas = tables.ToDictionary(t => t, _ => "(schema unavailable)");
+                            }
+                            if (priorSchemas.Count == 0)
+                            {
+                                // No source schemas at all — pass table names so the LLM at least knows what to ingest.
+                                priorSchemas = tables.ToDictionary(t => t, _ => "(schema unavailable)");
+                            }
+                        }
+                        else
+                        {
+                            // silver/gold/reporting: discover what's in the target lakehouse under bronze/silver/gold.
+                            await store.UpdateStatusAsync(run.RunId, $"Discovering{Capitalize(priorSrc)}Schemas");
+                            priorSchemas = await fabric.DiscoverLayerTablesAsync(ws, targetLakehouseId, priorSrc);
+                            if (priorSchemas.Count == 0)
+                            {
+                                // Hard-fail: the prior layer should have produced tables. Letting the LLM
+                                // proceed without seeing them re-introduces the exact hallucination class
+                                // we are trying to prevent.
+                                var failMsg = $"{layer}: prior layer '{priorSrc}' produced no discoverable tables in Tables/{priorSrc}/ — refusing to generate {layer} from spec-only context. Re-run from {priorSrc}.";
+                                bgLogger.LogError("Run {r}: {msg}", run.RunId, failMsg);
+                                await store.UpdateStatusAsync(run.RunId, "Failed", failMsg);
+                                return;
+                            }
+                            // For reporting, also include the test/test_results table if it exists, since the
+                            // semantic model / report may reference data-quality outputs.
+                            if (layer == "reporting")
+                            {
+                                try
+                                {
+                                    var testSchemas = await fabric.DiscoverLayerTablesAsync(ws, targetLakehouseId, "test", maxRetries: 1, initialDelayMs: 0);
+                                    foreach (var kv in testSchemas) priorSchemas[kv.Key] = kv.Value;
+                                }
+                                catch { /* best-effort */ }
+                            }
+                        }
+                        bgLogger.LogInformation("Run {r}: discovered {n} {p} tables for {layer} generation",
+                            run.RunId, priorSchemas.Count, priorSrc, layer);
+
+                        // ---- 2. Generate cells for THIS layer with real schemas ----
+                        await store.UpdateStatusAsync(run.RunId, $"Generating{Capitalize(layer)}Notebook");
+                        var layerCells = await builder.GenerateLayerNotebookAsync(
+                            layer, spec!, ws, srcWsForRun, run.SourceLakehouseId ?? "",
+                            targetLakehouseId, run.TargetLakehouseName!, tables, priorSchemas,
+                            run.RunId, body.Model);
+                        if (layerCells is null || layerCells.Count == 0)
+                        {
+                            var failMsg = $"{layer}: LLM did not return any notebook cells. Check the spec, model availability, and try again.";
+                            bgLogger.LogError("Run {r}: {msg}", run.RunId, failMsg);
+                            await store.UpdateStatusAsync(run.RunId, "Failed", failMsg);
+                            return;
                         }
 
                         // Notebook name: <lakehouse>_<layer> e.g. "MyLake_bronze". Sanitised to safe chars.
@@ -420,6 +553,7 @@ public static class ApiEndpoints
                         var nbName = $"{safeLh}_{layer}";
                         var nbContent = builder.BuildNotebookJson(layerCells, targetLakehouseId, run.TargetLakehouseName, ws);
 
+                        // ---- 3. Deploy ----
                         await store.UpdateStatusAsync(run.RunId, $"Deploying{Capitalize(layer)}");
                         var priorNb = layer switch {
                             "bronze" => run.BronzeNotebookId,
@@ -457,6 +591,7 @@ public static class ApiEndpoints
                             }
                         }
 
+                        // ---- 4. Run + poll ----
                         await store.UpdateStatusAsync(run.RunId, $"Running{Capitalize(layer)}");
                         await store.UpdateLayerAsync(run.RunId, layer, notebookId, null);
 
@@ -487,7 +622,11 @@ public static class ApiEndpoints
 
                     // Save final pointer for /api/build response + finalize.
                     await store.UpdateBuildAsync(run.RunId, targetLakehouseId, run.GoldNotebookId ?? run.SilverNotebookId ?? run.BronzeNotebookId, null);
-                    await store.UpdateStatusAsync(run.RunId, "Succeeded", "All three medallion notebooks ran successfully.");
+                    var ranLayers = allLayers.Skip(startIdx).ToArray();
+                    var msg = startIdx == 0
+                        ? "All medallion notebooks ran successfully."
+                        : $"Resumed from {startFromLayer}: {string.Join(" → ", ranLayers)} ran successfully.";
+                    await store.UpdateStatusAsync(run.RunId, "Succeeded", msg);
                 }
                 catch (Exception ex)
                 {

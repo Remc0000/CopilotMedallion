@@ -29,6 +29,49 @@ Also apply these reference skills (use their patterns from training):
 - **No saveAsTable** — schema-enabled lakehouses don't have a default DB context for unqualified saves. Always write Delta via `df.write.format('delta').save(abfss_path)`.
 - **Parameter cell** — every notebook receives a platform-injected parameters cell with `workspace_id, source_workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url`. Don't redefine these.
 
+### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
+These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
+
+Rule A — No dotted alias strings.
+- Never pass dotted strings like "c.customer_id", "ca.address_type", "h.sales_person", or "pc_child.name" to F.col(...), withColumn(...), Window.partitionBy(...), Window.orderBy(...), or select(...). Spark treats "c.customer_id" as a single column literally named c.customer_id, which does not resolve once any projection or rename has been applied.
+- Alias scope (.alias("c"), .alias("ca"), ...) is only valid inside the SAME select / join expression that introduces it. Once you produce a new DataFrame via select(...) or withColumn(...), the dotted alias form is gone and you must reference plain column names.
+
+Rule B — Materialize helper columns before they are needed downstream.
+- For any column that will later be referenced by a Window, a withColumn, or a downstream join after a projection, first materialize it as a flat, unambiguous helper column (e.g. rank_customer_id, rank_address_type, sales_person_source) in the same select that introduces the join aliases.
+
+Rule C — Do not drop a column before its last consumer has run.
+- Before adding a withColumn, verify every F.col(...) referenced by that expression still exists on the DataFrame at that step. If a previous select(...) projection removed it, either:
+  - (preferred) move the withColumn BEFORE the projection that drops the source column, OR
+  - keep the source column in the projection, OR
+  - re-derive the value from a column that IS still present (often a boolean/flag that was computed earlier from the same source).
+- Example of the failure to avoid: dropping discontinued_date in a select(...) and then later writing F.when(F.col('discontinued_date').isNotNull(), ...) inside withColumn('is_sellable_currently', ...). The column is gone and Spark raises UNRESOLVED_COLUMN.
+- When a boolean flag derived from a raw column already exists on the DataFrame (e.g. is_discontinued derived from discontinued_date), prefer reusing the flag (F.col('is_discontinued')) over re-reading the dropped raw column.
+
+Rule D — Order of derived-column computations matters.
+- When building several derived columns where one depends on another (e.g. is_discontinued, then is_sellable_currently which uses is_discontinued), add them in dependency order with sequential withColumn calls, and reference the already-derived flag in the next expression — do NOT reach back to a raw source column that may have been dropped.
+
+Rule E — Validate schema between non-trivial transformation steps.
+- After any select(...) / drop(...) / heavy withColumn chain, and BEFORE the next step that depends on specific columns, assert those columns exist. Fail fast with an error message that names the missing column and the DataFrame variable, so the auto-fixer gets an actionable diagnostic instead of a deep analyzer stack trace.
+
+Rule F — Self-check pattern for every withColumn / Window.
+- For every withColumn(name, expr) and every Window definition, confirm: "Every column referenced inside expr / inside the window's partitionBy / orderBy exists on the DataFrame at this exact point." If not, fix per Rule C before generating the code.
+
+Rule G — Optional-column helpers must return typed Column nulls, not Python None.
+- When defining a helper like `_maybe(df, name)` that returns the column if it exists on the DataFrame and a fallback otherwise, NEVER return Python `None`. Spark functions (`F.coalesce`, `F.greatest`, `F.least`, `F.concat`, `F.when(...).otherwise(...)`, etc.) reject `None` arguments with `PySparkTypeError: [NOT_COLUMN_OR_STR]` and the cell crashes BEFORE any later fallback (e.g. `F.current_timestamp()`) gets a chance to satisfy the call.
+- Correct pattern — return a typed null literal as a Spark Column:
+  ```
+  def _maybe(df, name, dtype='timestamp'):
+      return F.col(name) if name in df.columns else F.lit(None).cast(dtype)
+  ```
+  Pick the `dtype` to match the surrounding expression (`'timestamp'` for date/time coalesces, `'string'` for text, `'double'` for numeric, etc.) so Spark can resolve the result type without ambiguity.
+- Alternative pattern (when the helper genuinely cannot know the dtype) — filter `None`s at the call site BEFORE invoking the Spark function:
+  ```
+  candidates = [c for c in (_maybe(df, 'modified_date'), _maybe(df, 'order_date')) if c is not None]
+  df = df.withColumn('source_dt', F.to_date(F.coalesce(*candidates, F.current_timestamp())))
+  ```
+  Either approach is acceptable, but **never pass Python `None` directly into a Spark function**.
+- Applies to ALL optional-column lookups across Bronze, Silver, Gold — including audit-timestamp coalesces, optional-key joins, fallback string formatting, etc. This is a layer-agnostic rule.
+
 ## Bronze
 
 1:1 ingestion of the selected source tables into the `bronze` schema, adding `ingestion_timestamp`, `source_path`, `batch_id`, `ingestion_date` metadata columns. Mode: overwrite + overwriteSchema=true. Partitioned by `ingestion_date`.
