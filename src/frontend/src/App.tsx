@@ -652,10 +652,14 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
   async function previewSpecs(opts?: { initialSpecsOverride?: string }) {
     if (!sourceId || selectedTables.size === 0) return
-    const intent = `${selectedModel}|${sourceId}|${[...selectedTables].sort().join(',')}`
+    const initialSpecsToSend = opts?.initialSpecsOverride !== undefined ? opts.initialSpecsOverride : initialSpecs
+    // Include initialSpecs (hashed by length+prefix is enough) in the intent so an explicit
+    // "Process Specs" click does NOT collide with an in-flight auto-propose: they have
+    // different intents and the stale-guard correctly discards the older one.
+    const initialSpecsKey = initialSpecsToSend ? `${initialSpecsToSend.length}:${initialSpecsToSend.slice(0, 32)}` : ''
+    const intent = `${selectedModel}|${sourceId}|${[...selectedTables].sort().join(',')}|${initialSpecsKey}`
     proposeIntentRef.current = intent
     const modelAtCall = selectedModel
-    const initialSpecsToSend = opts?.initialSpecsOverride !== undefined ? opts.initialSpecsOverride : initialSpecs
     setError(null); setBusy(true)
     setBusyMsg(initialSpecsToSend
       ? `Processing your initial specs + asking ${modelAtCall ?? 'AI'} to flesh out the full 7-section spec…`
@@ -1185,7 +1189,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
         <Card>
           <CardHeader
-            header={<Title3>3.5 Initial specs (optional)</Title3>}
+            header={<Title3>4. Initial specs (optional)</Title3>}
             description={<Body1>Paste any business intent, modelling preferences, or special rules here. Click <b>Process Specs</b> and the LLM will turn it into a full 7-section spec (Generic / Bronze / Silver / Gold / Semantic / Report / Data Agent) using your initial specs + the actual source schemas + the Lakehouse name you typed above.</Body1>}
           />
           <div className={s.row} style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
@@ -1194,15 +1198,15 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
               onChange={(_, d) => setInitialSpecs(d.value)}
               placeholder={`Examples:\n  - "Build a sales dashboard with month-over-month growth on dim_product[category]."\n  - "Customers should be deduped on email_lower, keeping the most recent modified_date."\n  - "Treat all '_id' columns as integer keys; dim_date is NOT needed (use fact_sales[order_date] directly)."\n\nLeave empty if you don't have specific requirements — the LLM will just propose from the schemas.`}
               rows={6}
-              disabled={!!run || busy}
+              disabled={!!run}
               resize="vertical"
             />
             <div className={s.row}>
-              <Button appearance="primary" disabled={busy || !initialSpecs.trim() || !!run} onClick={processInitialSpecs}>
+              <Button appearance="primary" disabled={!initialSpecs.trim() || !!run} onClick={processInitialSpecs}>
                 ✨ Process Specs
               </Button>
               {busy && busyMsg && <Spinner size="tiny" label={busyMsg} />}
-              {!initialSpecs.trim() && <Caption1>Type some intent above to enable — or skip and use the auto-proposed spec in section 4.</Caption1>}
+              {!initialSpecs.trim() && <Caption1>Type some intent above to enable — or skip and use the auto-proposed spec in section 5.</Caption1>}
             </div>
           </div>
         </Card>
@@ -1210,7 +1214,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
 
       {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
         <Card>
-          <CardHeader header={<Title3>4. Review &amp; build</Title3>} />
+          <CardHeader header={<Title3>5. Review &amp; build</Title3>} />
           {!specDraft ? (
             <div className={s.row}>
               <Spinner size="tiny" label={busy ? busyMsg : `Asking ${selectedModel ?? 'AI'} to analyse your tables and propose a spec…`} />
@@ -1320,7 +1324,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       {run && (
         <Card ref={buildStatusRef}>
           <CardHeader
-            header={<Title3>5. Build status</Title3>}
+            header={<Title3>6. Build status</Title3>}
             description={(() => {
               const startedMs = run.createdAt ? Date.parse(run.createdAt) : NaN
               const isTerminal = ['Succeeded','Failed','Cancelled'].includes(run.status)
