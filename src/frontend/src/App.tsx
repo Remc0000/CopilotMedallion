@@ -11,8 +11,10 @@ import { api, getFabricToken, getOnelakeToken, inFabric, fabricWorkspaceId, fabr
 
 const useStyles = makeStyles({
   shell: { maxWidth: '960px', margin: '0 auto', padding: '24px', display: 'flex', flexDirection: 'column' as const, gap: '14px' },
-  headerBar: { display: 'flex', alignItems: 'center', gap: '14px', paddingBottom: '8px', borderBottom: `1px solid ${tokens.colorNeutralStroke2}`, marginBottom: '6px' },
-  headerTitle: { flex: 1, textAlign: 'center' as const },
+  headerBar: { display: 'grid', gridTemplateColumns: '1fr auto 1fr', alignItems: 'center', gap: '14px', paddingBottom: '8px', borderBottom: `1px solid ${tokens.colorNeutralStroke2}`, marginBottom: '6px' },
+  headerLogoLeft: { justifySelf: 'start' as const },
+  headerLogoRight: { justifySelf: 'end' as const },
+  headerTitle: { textAlign: 'center' as const },
   logo: { height: '156px', width: 'auto' },
   logoLeft: { height: '120px', width: 'auto' },
   row: { display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' as const },
@@ -1015,7 +1017,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   return (
     <div className={s.shell}>
       <div className={s.headerBar}>
-        <a href="#" onClick={(e) => e.preventDefault()} title="Copilot Medallion">
+        <a href="#" onClick={(e) => e.preventDefault()} title="Copilot Medallion" className={s.headerLogoLeft}>
           <img src="/logo.png" alt="Copilot Medallion" className={s.logoLeft} />
         </a>
         <div className={s.headerTitle}>
@@ -1027,7 +1029,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
             {effectivelySignedIn && <> · <FLink onClick={() => { setGuidanceOpen(true); if (!guidanceItems) loadGuidance() }} as="button" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>📚 Guidance history</FLink></>}
           </Caption1>
         </div>
-        <a href="https://github.com/Remc0000" target="_blank" rel="noreferrer" title="Remc0000 on GitHub">
+        <a href="https://github.com/Remc0000" target="_blank" rel="noreferrer" title="Remc0000 on GitHub" className={s.headerLogoRight}>
           <img src="/remc0000-wordmark.png" alt="Remc0000" className={s.logo} />
         </a>
       </div>
