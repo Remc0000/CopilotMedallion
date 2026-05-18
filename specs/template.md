@@ -89,9 +89,9 @@ AdventureWorksLT shape:
 - **Dim_Sales** — degenerate dimension on the cleaned salesperson from salesorderheader (strip leading `adventureworks/`, strip trailing digits).
 - **Fact_Sales** — join salesorderdetail + salesorderheader, keep all relevant fields, AND include the cleaned `sales_person` column (same cleaning as Dim_Sales) so reports can aggregate by it.
 
-### Data quality tests (in the gold notebook)
+## Test
 
-Add a `test` schema with table `test_results` (run_id, test_name, layer, table_name, status, actual, expected, details, checked_at). APPEND rows so history is preserved. Run at minimum:
+Data quality tests run by the gold notebook AFTER the gold tables are written. Write rows to a `test` schema, table `test_results` with columns (run_id, test_name, layer, table_name, status, actual, expected, details, checked_at). Use APPEND mode so history is preserved. Each test wraps in try/except — failures become `FAIL`/`ERROR` rows, not crashed cells. Run at minimum:
 
 1. Row counts per layer (bronze ≈ silver within 1%).
 2. No-null primary keys in gold dims.

@@ -355,10 +355,10 @@ Produce the JSON now.";
 - The 'prior_layer_schemas' input describes the EXACT columns now present in silver. Build dims/facts using ONLY columns that appear there.
 - BEFORE any gold write, set: spark.conf.set('spark.sql.parquet.vorder.default','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.enabled','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.binSize','1g').
 - Read silver tables into a dict keyed by lowercased table name (read from f'{tgt_base}/Tables/silver/<name>').
-- Build the dims and facts described in the spec (e.g. dim_customer, dim_product, dim_sales, fact_sales). Always alias both sides of joins (`.alias('c').join(other.alias('ca'), c.customer_id == ca.customer_id, 'left')`). Write each to f'{tgt_base}/Tables/gold/<name>'.
-- Then run the data-quality tests described in the spec and APPEND rows to f'{tgt_base}/Tables/test/test_results'. Test rows schema: run_id STRING, test_name STRING, layer STRING, table_name STRING, status STRING (PASS/FAIL/ERROR), actual STRING, expected STRING, details STRING, checked_at TIMESTAMP. Use mode='append' option('mergeSchema','true').
+- Build the dims and facts described in the spec's '## Gold' section (e.g. dim_customer, dim_product, dim_sales, fact_sales). Always alias both sides of joins (`.alias('c').join(other.alias('ca'), c.customer_id == ca.customer_id, 'left')`). Write each to f'{tgt_base}/Tables/gold/<name>'.
+- Then run the data-quality tests described in the spec's separate '## Test' section and APPEND rows to f'{tgt_base}/Tables/test/test_results'. Test rows schema: run_id STRING, test_name STRING, layer STRING, table_name STRING, status STRING (PASS/FAIL/ERROR), actual STRING, expected STRING, details STRING, checked_at TIMESTAMP. Use mode='append' option('mergeSchema','true'). Each test in its own try/except — a failing test produces a FAIL row, never crashes the cell.
 - Build a gold_results dict + a test_summary dict and print combined JSON summary.
-- Hard-fail (raise) on any error after _save_error('gold', e).",
+- Hard-fail (raise) on any error after _save_error('gold', e). (Test failures DO NOT raise — they just write FAIL rows; only infrastructure/cell errors raise.)",
             "reporting" => @"REPORTING notebook (Power BI semantic model + report + Data Agent):
 - The 'prior_layer_schemas' input describes the EXACT columns currently sitting in gold (and test/test_results if discovered). Build TMSL columns from these — never from spec text alone.
 - import requests, base64, json, time, traceback. Get tok = notebookutils.credentials.getToken('pbi'). BASE_URL = f'https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}'.
@@ -541,7 +541,10 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 (cleaning, dedup keys, snake_case rename, audit columns, OPTIMIZE — for each table call out the dedup key you'd use based on the columns)
 
 ## Gold
-(dims + facts + data quality tests — propose specific dim/fact tables based on the ACTUAL columns; identify which tables look like facts vs dims vs junction tables. Include the 5 standard tests in a `### Data quality tests` subsection.)
+(dims + facts — propose specific dim/fact tables based on the ACTUAL columns; identify which tables look like facts vs dims vs junction tables. Do NOT include data-quality tests here — they live in the separate ## Test section below.)
+
+## Test
+(data quality tests to run after Gold writes — include the 5 standard tests: row counts per layer (bronze ≈ silver within 1%), no-null PKs in gold dims, unique PKs in gold dims, referential integrity (every fact FK exists in its dim), and at least one business-rule sanity check tailored to the data. Each test appends one row to a `test/test_results` table with schema: run_id, test_name, layer, table_name, status (PASS/FAIL/ERROR), actual, expected, details, checked_at.)
 
 ## Semantic model
 (Direct Lake star schema with explicit measures — propose tables, relationships, measures relevant to the actual columns you see)
@@ -566,7 +569,7 @@ PROPOSAL RULES:
 
 INTENT OVER DETAILED COLUMN LISTS (IMPORTANT):
 - The build pipeline runs each layer's notebook ONE AT A TIME and inspects the ACTUAL produced tables between layers. The per-layer notebook generator receives the real column lists at runtime and is instructed to trust those over any spec text that contradicts them.
-- Therefore, the layer sections (Bronze/Silver/Gold/Semantic/Report) should describe INTENT and SHAPE — what tables to produce, what joins to perform, what measures to expose, what data-quality tests to run — NOT exhaustive column-by-column field listings. Naming specific business-meaningful columns is fine and helpful (e.g. ""include cleaned sales_person""), but do not try to enumerate every column of every table; that information becomes stale the moment the bronze rename happens and the LLM will rediscover it at runtime anyway.
+- Therefore, the layer sections (Bronze/Silver/Gold/Test/Semantic/Report) should describe INTENT and SHAPE — what tables to produce, what joins to perform, what measures to expose, what data-quality tests to run — NOT exhaustive column-by-column field listings. Naming specific business-meaningful columns is fine and helpful (e.g. ""include cleaned sales_person""), but do not try to enumerate every column of every table; that information becomes stale the moment the bronze rename happens and the LLM will rediscover it at runtime anyway.
 - Rule of thumb: if a sentence reads like a schema dump (""columns: id INT, name STRING, …""), trim it. If it reads like a design decision (""dedupe customer rows on customer_id, keeping the latest modified_date""), keep it.";
 
         var schemaSection = tableSchemas != null && tableSchemas.Count > 0
@@ -616,7 +619,7 @@ Produce the spec markdown now. Base every modeling decision on the columns above
         var system = @"You are an expert Microsoft Fabric data engineer reviewing a failed medallion build.
 
 You are given:
-1. The current spec markdown (the user's build instructions, split into 7 sections: Generic guidance, Bronze, Silver, Gold, Semantic model, Report, Data Agent).
+1. The current spec markdown (the user's build instructions, split into 8 sections: Generic guidance, Bronze, Silver, Gold, Test, Semantic model, Report, Data Agent).
 2. The Spark traceback from the cell that failed.
 3. Optional metadata: which iteration this is, which layer failed, and the run id.
 
@@ -624,7 +627,7 @@ Your job: produce an UPDATED spec markdown that prevents this specific failure o
 
 Rules:
 - Return ONLY the updated spec markdown. No prose around it, no JSON, no code fences wrapping the whole output.
-- Preserve the existing top-level structure exactly: the '# Run Spec ...' heading, '## Inputs', '## Generic guidance', '## Bronze', '## Silver', '## Gold', '## Semantic model', '## Report', '## Data Agent'. Do not delete the Inputs block.
+- Preserve the existing top-level structure exactly: the '# Run Spec ...' heading, '## Inputs', '## Generic guidance', '## Bronze', '## Silver', '## Gold', '## Test', '## Semantic model', '## Report', '## Data Agent'. Do not delete the Inputs block.
 - ## Generic guidance: you MAY revise it (the user trusts the LLM here). If the failure exposes a new cross-cutting rule, add it. Keep the skill/agent URL list intact at the top.
 - Sharpen language in the relevant LAYER section (Bronze/Silver/Gold/Semantic/Report/DataAgent) that caused the failure (UNRESOLVED_COLUMN → name the column; AMBIGUOUS_REFERENCE → alias-prefix joins; missing junction-table column → name the real columns).
 - CROSS-TABLE ROOT-CAUSE ANALYSIS — REQUIRED: before writing the fix, list every source table referenced in the '## Inputs' section of the spec and ask yourself: ""Could this same root cause hit ANY of the other tables on the next run?"" Many failures (snake_case rename collisions, columns that disappear after a select(), ambiguous join keys, NULL handling, type coercion, missing columns on junction tables) are SYSTEMIC. If the root cause is plausibly systemic across multiple tables, do ONE of the following — never both:
@@ -686,9 +689,10 @@ Produce the updated spec markdown now. Remember to PREPEND a '## Updated specs' 
         if (!_llm.Configured) return null;
         var downstreamMap = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
         {
-            ["bronze"]   = new[] { "Silver", "Gold", "Semantic model", "Report", "Data Agent" },
-            ["silver"]   = new[] { "Gold", "Semantic model", "Report", "Data Agent" },
-            ["gold"]     = new[] { "Semantic model", "Report", "Data Agent" },
+            ["bronze"]   = new[] { "Silver", "Gold", "Test", "Semantic model", "Report", "Data Agent" },
+            ["silver"]   = new[] { "Gold", "Test", "Semantic model", "Report", "Data Agent" },
+            ["gold"]     = new[] { "Test", "Semantic model", "Report", "Data Agent" },
+            ["test"]     = new[] { "Semantic model", "Report", "Data Agent" },
             ["semantic"] = new[] { "Report", "Data Agent" },
             ["report"]   = new[] { "Data Agent" },
             ["agent"]    = Array.Empty<string>(),
@@ -710,7 +714,7 @@ Downstream sections to re-propose: {downstreamList}
 
 STRICT RULES:
 1. Return ONLY the full updated spec markdown. No prose, no code fences wrapping the whole thing, no JSON.
-2. Preserve the existing top-level structure exactly: '# Run Spec ...', any '## Updated specs', '## Inputs', '## Generic guidance', '## Bronze', '## Silver', '## Gold', '## Semantic model', '## Report', '## Data Agent'.
+2. Preserve the existing top-level structure exactly: '# Run Spec ...', any '## Updated specs', '## Inputs', '## Generic guidance', '## Bronze', '## Silver', '## Gold', '## Test', '## Semantic model', '## Report', '## Data Agent'.
 3. KEEP VERBATIM all sections at or upstream of the edited section ('## {Capitalize(editedSection)}' and everything above it). Do not modify Inputs, Generic guidance, or any upstream layer's content.
 4. REWRITE the downstream sections ({downstreamList}) so they are consistent with the edited section. Be specific: name columns, tables, measures based on what the upstream now says. Don't invent things not implied by the upstream content.
 5. Keep section ordering exactly the same.
@@ -750,6 +754,7 @@ The user just edited '## {Capitalize(editedSection)}'. Re-propose {downstreamLis
         ("bronze", "## Bronze"),
         ("silver", "## Silver"),
         ("gold", "## Gold"),
+        ("test", "## Test"),
         ("semantic", "## Semantic model"),
         ("report", "## Report"),
         ("agent", "## Data Agent"),

@@ -37,6 +37,7 @@ const SECTION_PATTERNS: Record<string, RegExp> = {
   bronze: /^##\s+Bronze\s*$/im,
   silver: /^##\s+Silver\s*$/im,
   gold: /^##\s+Gold\s*$/im,
+  test: /^##\s+Test\s*$/im,
   semantic: /^##\s+Semantic model\s*$/im,
   report: /^##\s+Report\s*$/im,
   agent: /^##\s+Data Agent\s*$/im,
@@ -44,8 +45,8 @@ const SECTION_PATTERNS: Record<string, RegExp> = {
 // Note: '## Updated specs' is intentionally NOT in SECTION_PATTERNS so it lands in the
 // 'header' chunk along with '# Run Spec' / '## Inputs'. It's displayed as a banner above
 // the editable section accordions on the next render.
-function splitSpec(spec: string): { header: string; generic: string; bronze: string; silver: string; gold: string; semantic: string; report: string; agent: string } {
-  const empty = { header: '', generic: '', bronze: '', silver: '', gold: '', semantic: '', report: '', agent: '' }
+function splitSpec(spec: string): { header: string; generic: string; bronze: string; silver: string; gold: string; test: string; semantic: string; report: string; agent: string } {
+  const empty = { header: '', generic: '', bronze: '', silver: '', gold: '', test: '', semantic: '', report: '', agent: '' }
   if (!spec) return empty
   const lines = spec.split(/\r?\n/)
   const slots: Array<{ key: string; line: number }> = []
@@ -57,13 +58,13 @@ function splitSpec(spec: string): { header: string; generic: string; bronze: str
   slots.sort((a, b) => a.line - b.line)
   if (slots.length === 0) return { ...empty, header: spec }
   const header = lines.slice(0, slots[0].line).join('\n').trim()
-  const out: Record<string, string> = { generic: '', bronze: '', silver: '', gold: '', semantic: '', report: '', agent: '' }
+  const out: Record<string, string> = { generic: '', bronze: '', silver: '', gold: '', test: '', semantic: '', report: '', agent: '' }
   for (let i = 0; i < slots.length; i++) {
     const start = slots[i].line
     const end = i + 1 < slots.length ? slots[i + 1].line : lines.length
     out[slots[i].key] = lines.slice(start, end).join('\n').trim()
   }
-  return { header, generic: out.generic, bronze: out.bronze, silver: out.silver, gold: out.gold, semantic: out.semantic, report: out.report, agent: out.agent }
+  return { header, generic: out.generic, bronze: out.bronze, silver: out.silver, gold: out.gold, test: out.test, semantic: out.semantic, report: out.report, agent: out.agent }
 }
 // Canonical H2 heading for each section. Used by joinSpec to prepend the heading when the
 // user's section body doesn't already start with it — otherwise splitSpec on the rejoined
@@ -74,6 +75,7 @@ const SECTION_HEADINGS: Record<string, string> = {
   bronze: '## Bronze',
   silver: '## Silver',
   gold: '## Gold',
+  test: '## Test',
   semantic: '## Semantic model',
   report: '## Report',
   agent: '## Data Agent',
@@ -91,13 +93,14 @@ function ensureHeading(key: string, body: string): string {
   return heading + '\n\n' + body.trimStart()
 }
 
-function joinSpec(parts: { header: string; generic: string; bronze: string; silver: string; gold: string; semantic: string; report: string; agent: string }): string {
+function joinSpec(parts: { header: string; generic: string; bronze: string; silver: string; gold: string; test: string; semantic: string; report: string; agent: string }): string {
   const sections = [
     parts.header,
     ensureHeading('generic', parts.generic),
     ensureHeading('bronze', parts.bronze),
     ensureHeading('silver', parts.silver),
     ensureHeading('gold', parts.gold),
+    ensureHeading('test', parts.test),
     ensureHeading('semantic', parts.semantic),
     ensureHeading('report', parts.report),
     ensureHeading('agent', parts.agent),
@@ -118,7 +121,9 @@ function earliestChangedLayer(oldSpec: string, newSpec: string): BuildLayer | nu
   const norm = (s: string) => (s ?? '').trim()
   if (norm(o.bronze) !== norm(n.bronze)) return 'bronze'
   if (norm(o.silver) !== norm(n.silver)) return 'silver'
-  if (norm(o.gold) !== norm(n.gold)) return 'gold'
+  // Test changes are consumed by the gold notebook (which writes Tables/test/test_results),
+  // so a Test edit means we need to re-run gold (and everything after).
+  if (norm(o.gold) !== norm(n.gold) || norm(o.test) !== norm(n.test)) return 'gold'
   if (norm(o.semantic) !== norm(n.semantic) ||
       norm(o.report) !== norm(n.report) ||
       norm(o.agent) !== norm(n.agent)) return 'reporting'
@@ -283,6 +288,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const [specBronze, setSpecBronze] = useState('')
   const [specSilver, setSpecSilver] = useState('')
   const [specGold, setSpecGold] = useState('')
+  const [specTest, setSpecTest] = useState('')
   const [specSemantic, setSpecSemantic] = useState('')
   const [specReport, setSpecReport] = useState('')
   const [specAgent, setSpecAgent] = useState('')
@@ -779,11 +785,18 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   }
 
   // After the user edits a section, ask the LLM to revise downstream sections so the
-  // chain (Bronze → Silver → Gold → Semantic → Report → Data Agent) stays consistent.
+  // chain (Bronze → Silver → Gold → Test → Semantic → Report → Data Agent) stays consistent.
   async function propagateDownstream(editedSectionKey: string) {
-    if (!['bronze','silver','gold','semantic','report'].includes(editedSectionKey)) return
+    if (!['bronze','silver','gold','test','semantic','report'].includes(editedSectionKey)) return
     setError(null); setBusy(true)
-    const labelMap: Record<string,string> = { bronze: 'Silver/Gold/Semantic/Report/Data Agent', silver: 'Gold/Semantic/Report/Data Agent', gold: 'Semantic/Report/Data Agent', semantic: 'Report/Data Agent', report: 'Data Agent' }
+    const labelMap: Record<string,string> = {
+      bronze: 'Silver/Gold/Test/Semantic/Report/Data Agent',
+      silver: 'Gold/Test/Semantic/Report/Data Agent',
+      gold: 'Test/Semantic/Report/Data Agent',
+      test: 'Semantic/Report/Data Agent',
+      semantic: 'Report/Data Agent',
+      report: 'Data Agent',
+    }
     setBusyMsg(`Asking ${selectedModel ?? 'AI'} to update ${labelMap[editedSectionKey] ?? 'downstream sections'}…`)
     try {
       const combined = recombineSpec()
@@ -798,10 +811,10 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       // only replace the downstream sections from the response, with a fallback to the current
       // local value if a section is missing in the response. This guarantees the editor cannot
       // go blank even if the backend or LLM returns a malformed/partial response.
-      const orderKeys = ['generic','bronze','silver','gold','semantic','report','agent'] as const
+      const orderKeys = ['generic','bronze','silver','gold','test','semantic','report','agent'] as const
       const editedIdx = orderKeys.indexOf(editedSectionKey as typeof orderKeys[number])
       const llmParts = splitSpec(r.markdown)
-      const local = { header: specHeader, generic: specGeneric, bronze: specBronze, silver: specSilver, gold: specGold, semantic: specSemantic, report: specReport, agent: specAgent }
+      const local = { header: specHeader, generic: specGeneric, bronze: specBronze, silver: specSilver, gold: specGold, test: specTest, semantic: specSemantic, report: specReport, agent: specAgent }
       const merged: typeof local = { ...local }
       if (editedIdx >= 0) {
         for (let i = editedIdx + 1; i < orderKeys.length; i++) {
@@ -900,7 +913,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     return true
   }
 
-  // Whenever specDraft changes (from preview/restore), split into 4 sections.
+  // Whenever specDraft changes (from preview/restore), split into the editable sections.
   // When any section changes, recombine into specDraft so existing build flow keeps working.
   useEffect(() => {
     const parts = splitSpec(specDraft)
@@ -909,6 +922,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     setSpecBronze(parts.bronze)
     setSpecSilver(parts.silver)
     setSpecGold(parts.gold)
+    setSpecTest(parts.test)
     setSpecSemantic(parts.semantic)
     setSpecReport(parts.report)
     setSpecAgent(parts.agent)
@@ -922,6 +936,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
       bronze: specBronze,
       silver: specSilver,
       gold: specGold,
+      test: specTest,
       semantic: specSemantic,
       report: specReport,
       agent: specAgent,
@@ -1242,12 +1257,13 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                 )
               })()}
 
-              {/* Seven collapsible spec sections */}
+              {/* Editable spec sections */}
               {[
                 { key: 'generic',   icon: '🧭', label: 'Generic guidance (no need to edit — LLM maintains)', value: specGeneric,   setter: setSpecGeneric,   placeholder: '## Generic guidance\n\nWhich skills/agents should the LLM follow? Cross-cutting rules…' },
                 { key: 'bronze',    icon: '🥉', label: 'Bronze (raw ingestion)',                          value: specBronze,    setter: setSpecBronze,    placeholder: '## Bronze\n\nHow each source table is landed: metadata columns, write mode, partitioning…' },
                 { key: 'silver',    icon: '🥈', label: 'Silver (cleaning & dedup)',                       value: specSilver,    setter: setSpecSilver,    placeholder: '## Silver\n\nDedup, snake_case, fully-null drop, audit columns, OPTIMIZE…' },
-                { key: 'gold',      icon: '🥇', label: 'Gold (dims/facts + data quality tests)',          value: specGold,      setter: setSpecGold,      placeholder: '## Gold\n\nDims, facts, joins, measures-supporting columns, data quality tests…' },
+                { key: 'gold',      icon: '🥇', label: 'Gold (dims & facts)',                             value: specGold,      setter: setSpecGold,      placeholder: '## Gold\n\nDims, facts, joins, measures-supporting columns…' },
+                { key: 'test',      icon: '🧪', label: 'Test (data quality)',                             value: specTest,      setter: setSpecTest,      placeholder: '## Test\n\nData quality tests to run after Gold writes: row counts, no-null PKs, unique PKs, referential integrity, business-rule sanity checks. Each test is one row in the test/test_results table.' },
                 { key: 'semantic',  icon: '🧊', label: 'Semantic Model (Direct Lake)',                    value: specSemantic,  setter: setSpecSemantic,  placeholder: '## Semantic model\n\nDescribe tables, relationships, measures…' },
                 { key: 'report',    icon: '📊', label: 'Power BI Report',                                 value: specReport,    setter: setSpecReport,    placeholder: '## Report\n\nDescribe pages, visuals, filters…' },
                 { key: 'agent',     icon: '🤖', label: 'Data Agent (AISkill on the semantic model)',      value: specAgent,     setter: setSpecAgent,     placeholder: '## Data Agent\n\nDescribe role, instructions, starter questions, guardrails…' },
@@ -1277,7 +1293,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                           resize="vertical"
                           style={{ fontFamily: 'monospace', fontSize: 12, width: '100%' }}
                         />
-                        {['bronze','silver','gold','semantic','report'].includes(sec.key) && (
+                        {['bronze','silver','gold','test','semantic','report'].includes(sec.key) && (
                           <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 10 }}>
                             <Button
                               size="small"
@@ -1287,7 +1303,14 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                             >
                               Update downstream sections
                             </Button>
-                            <Caption1>Re-runs the LLM to keep {sec.key === 'bronze' ? 'Silver/Gold/Semantic/Report/Data Agent' : sec.key === 'silver' ? 'Gold/Semantic/Report/Data Agent' : sec.key === 'gold' ? 'Semantic/Report/Data Agent' : sec.key === 'semantic' ? 'Report/Data Agent' : 'Data Agent'} consistent with your edits above.</Caption1>
+                            <Caption1>Re-runs the LLM to keep {
+                              sec.key === 'bronze' ? 'Silver/Gold/Test/Semantic/Report/Data Agent'
+                              : sec.key === 'silver' ? 'Gold/Test/Semantic/Report/Data Agent'
+                              : sec.key === 'gold' ? 'Test/Semantic/Report/Data Agent'
+                              : sec.key === 'test' ? 'Semantic/Report/Data Agent'
+                              : sec.key === 'semantic' ? 'Report/Data Agent'
+                              : 'Data Agent'
+                            } consistent with your edits above.</Caption1>
                           </div>
                         )}
                       </div>
