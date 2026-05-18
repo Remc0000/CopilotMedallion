@@ -700,15 +700,11 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     }
   }
 
-  // Explicit "Process Specs" click: send the user's initial-specs textarea to the LLM
-  // proposer so it produces a full 7-section spec built AROUND the user's intent + the
-  // discovered source schemas. Forces a re-run even if a spec already exists.
-  async function processInitialSpecs() {
-    if (!initialSpecs.trim()) return
-    // Reset the auto-propose dedup key so the in-flight stale-guard doesn't block this call.
-    autoProposedForKeyRef.current = null
-    await previewSpecs({ initialSpecsOverride: initialSpecs })
-  }
+  // Explicit Re-propose flow: section 5's "Re-propose with AI" button calls previewSpecs()
+  // directly. It picks up the latest initialSpecs from state, so the user can update the
+  // initial-specs textarea (section 3) and click Re-propose to regenerate the full spec
+  // accordingly. No standalone "Process Specs" button — auto-propose in section 4 is the
+  // primary trigger.
 
   // Auto-propose: as soon as the user has chosen a model + source + at least one table,
   // call the LLM in the background and fill the spec editor. No "Propose Specs" click needed.
@@ -1097,9 +1093,66 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
         </Card>
       )}
 
+      {/* Section 2 — Choose target Lakehouse. Moved BEFORE source/tables so the user can type
+          the lakehouse name and have it baked into the auto-proposed spec when section 4 fires.
+          Available right after sign-in; doesn't depend on having picked source tables. */}
       {effectivelySignedIn && (
         <Card>
-          <CardHeader header={<Title3>2. Pick source &amp; tables</Title3>} />
+          <CardHeader header={<Title3>2. Choose target Lakehouse</Title3>} description={<Body1>Pick an existing Lakehouse via the top-bar <b>Pick target Lakehouse…</b> button, or just type a name below to create a fresh one.</Body1>} />
+          {targetLakehouseId ? (
+            <div className={s.row}>
+              <Caption1>
+                Using existing target: <strong>{targetLakehouseName2 ?? '(unknown)'}</strong>
+                {targetWorkspaceId && targetWorkspaceId !== fabricWorkspaceId && <> · workspace <strong>{targetWorkspaceName ?? '(unknown)'}</strong></>}
+              </Caption1>
+              {!run && (
+                <Button disabled={busy} onClick={() => {
+                  setTargetLakehouseId(null); setTargetWorkspaceId(null); setTargetWorkspaceName(null); setTargetLakehouseName2(null)
+                  ;(window as any).__copilotMedallionTargetWs = null
+                  setTargetName('')
+                }}>Clear</Button>
+              )}
+            </div>
+          ) : (
+            <div className={s.row}>
+              <Label htmlFor="tn">Target Lakehouse name (creates new)</Label>
+              <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(type a name to use it — or leave empty for an auto-generated one)" disabled={!!run} />
+            </div>
+          )}
+        </Card>
+      )}
+
+      {/* Section 3 — Initial specs (optional). Available right after sign-in so the user can
+          declare business intent / modelling preferences BEFORE picking source tables. When
+          they pick source & tables in section 4, the auto-propose effect fires and uses
+          whatever is in this textarea as the highest-priority design intent. No explicit
+          "Process Specs" button — section 4 is the trigger. */}
+      {effectivelySignedIn && (
+        <Card>
+          <CardHeader
+            header={<Title3>3. Initial specs (optional)</Title3>}
+            description={<Body1>Paste any business intent, modelling preferences, or special rules here. When you pick source tables in <b>section 4</b>, the LLM will turn your initial specs + the actual source schemas + the Lakehouse name above into a full 7-section spec automatically.</Body1>}
+          />
+          <div className={s.row} style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+            <Textarea
+              value={initialSpecs}
+              onChange={(_, d) => setInitialSpecs(d.value)}
+              placeholder={`Examples:\n  - "Build a sales dashboard with month-over-month growth on dim_product[category]."\n  - "Customers should be deduped on email_lower, keeping the most recent modified_date."\n  - "Treat all '_id' columns as integer keys; dim_date is NOT needed (use fact_sales[order_date] directly)."\n\nLeave empty to let the LLM propose purely from the schemas.`}
+              rows={6}
+              disabled={!!run}
+              resize="vertical"
+            />
+            <Caption1>You can also edit any individual section directly in section 5 after the spec is proposed. To re-propose with updated initial specs, click <b>Re-propose with AI</b> in section 5.</Caption1>
+          </div>
+        </Card>
+      )}
+
+      {/* Section 4 — Pick source & tables. Triggers auto-propose. By the time the user
+          gets here, model + target lakehouse name + initial specs are all in state, so the
+          first spec proposal already incorporates everything they typed above. */}
+      {effectivelySignedIn && (
+        <Card>
+          <CardHeader header={<Title3>4. Pick source &amp; tables</Title3>} />
           {inFabricRuntime ? (
             sourceId ? (
               <div className={s.status}>
@@ -1150,65 +1203,6 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
             </>
           )}
           {(sourceId && selectedTables.size > 0) && null}
-        </Card>
-      )}
-
-      {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
-        <Card>
-          <CardHeader header={<Title3>3. Choose target Lakehouse</Title3>} description={<Body1>Pick an existing Lakehouse via the top-bar <b>Pick target Lakehouse…</b> button, or just type a name below to create a fresh one.</Body1>} />
-          {targetLakehouseId ? (
-            <div className={s.row}>
-              <Caption1>
-                Using existing target: <strong>{targetLakehouseName2 ?? '(unknown)'}</strong>
-                {targetWorkspaceId && targetWorkspaceId !== fabricWorkspaceId && <> · workspace <strong>{targetWorkspaceName ?? '(unknown)'}</strong></>}
-              </Caption1>
-              {!run && (
-                <Button disabled={busy} onClick={() => {
-                  setTargetLakehouseId(null); setTargetWorkspaceId(null); setTargetWorkspaceName(null); setTargetLakehouseName2(null)
-                  ;(window as any).__copilotMedallionTargetWs = null
-                  setTargetName('')
-                }}>Clear</Button>
-              )}
-            </div>
-          ) : (
-            <div className={s.row}>
-              <Label htmlFor="tn">Target Lakehouse name (creates new)</Label>
-              <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(type a name to use it — or leave empty for an auto-generated one)" disabled={!!run} />
-            </div>
-          )}
-        </Card>
-      )}
-
-      {/* Section 3.5 — Initial specs (optional).
-          Lets the user paste free-form business intent ("I want a finance reporting solution
-          with monthly revenue trends and a dim_account that consolidates these source codes…")
-          and have the LLM produce a properly-structured 7-section spec around it, grounded in
-          the actual source schemas. The auto-propose effect still runs in the background for
-          users who want a zero-click flow; this section is for users who want to steer the
-          proposal up-front. */}
-      {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
-        <Card>
-          <CardHeader
-            header={<Title3>4. Initial specs (optional)</Title3>}
-            description={<Body1>Paste any business intent, modelling preferences, or special rules here. Click <b>Process Specs</b> and the LLM will turn it into a full 7-section spec (Generic / Bronze / Silver / Gold / Semantic / Report / Data Agent) using your initial specs + the actual source schemas + the Lakehouse name you typed above.</Body1>}
-          />
-          <div className={s.row} style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
-            <Textarea
-              value={initialSpecs}
-              onChange={(_, d) => setInitialSpecs(d.value)}
-              placeholder={`Examples:\n  - "Build a sales dashboard with month-over-month growth on dim_product[category]."\n  - "Customers should be deduped on email_lower, keeping the most recent modified_date."\n  - "Treat all '_id' columns as integer keys; dim_date is NOT needed (use fact_sales[order_date] directly)."\n\nLeave empty if you don't have specific requirements — the LLM will just propose from the schemas.`}
-              rows={6}
-              disabled={!!run}
-              resize="vertical"
-            />
-            <div className={s.row}>
-              <Button appearance="primary" disabled={!initialSpecs.trim() || !!run} onClick={processInitialSpecs}>
-                ✨ Process Specs
-              </Button>
-              {busy && busyMsg && <Spinner size="tiny" label={busyMsg} />}
-              {!initialSpecs.trim() && <Caption1>Type some intent above to enable — or skip and use the auto-proposed spec in section 5.</Caption1>}
-            </div>
-          </div>
         </Card>
       )}
 
