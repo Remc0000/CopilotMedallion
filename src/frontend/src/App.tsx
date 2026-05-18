@@ -65,8 +65,44 @@ function splitSpec(spec: string): { header: string; generic: string; bronze: str
   }
   return { header, generic: out.generic, bronze: out.bronze, silver: out.silver, gold: out.gold, semantic: out.semantic, report: out.report, agent: out.agent }
 }
+// Canonical H2 heading for each section. Used by joinSpec to prepend the heading when the
+// user's section body doesn't already start with it — otherwise splitSpec on the rejoined
+// markdown would fail to locate the section and silently drop its content on the next
+// re-render (the textareas would revert to their placeholder text).
+const SECTION_HEADINGS: Record<string, string> = {
+  generic: '## Generic guidance',
+  bronze: '## Bronze',
+  silver: '## Silver',
+  gold: '## Gold',
+  semantic: '## Semantic model',
+  report: '## Report',
+  agent: '## Data Agent',
+}
+
+function ensureHeading(key: string, body: string): string {
+  if (!body || !body.trim()) return ''
+  const heading = SECTION_HEADINGS[key]
+  if (!heading) return body
+  // Already starts with the right heading? Leave it alone.
+  const trimmed = body.trimStart()
+  if (new RegExp('^' + heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$', 'im').test(trimmed.split('\n')[0])) {
+    return body
+  }
+  return heading + '\n\n' + body.trimStart()
+}
+
 function joinSpec(parts: { header: string; generic: string; bronze: string; silver: string; gold: string; semantic: string; report: string; agent: string }): string {
-  return [parts.header, parts.generic, parts.bronze, parts.silver, parts.gold, parts.semantic, parts.report, parts.agent].filter(s => s && s.length).join('\n\n').trim() + '\n'
+  const sections = [
+    parts.header,
+    ensureHeading('generic', parts.generic),
+    ensureHeading('bronze', parts.bronze),
+    ensureHeading('silver', parts.silver),
+    ensureHeading('gold', parts.gold),
+    ensureHeading('semantic', parts.semantic),
+    ensureHeading('report', parts.report),
+    ensureHeading('agent', parts.agent),
+  ]
+  return sections.filter(s => s && s.length).join('\n\n').trim() + '\n'
 }
 
 // Layers the backend actually executes, in build order.
@@ -238,6 +274,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   const [tables, setTables] = useState<Table[]>([])
   const [selectedTables, setSelectedTables] = useState<Set<string>>(new Set())
   const [targetName, setTargetName] = useState('')
+  const [initialSpecs, setInitialSpecs] = useState('')
   const [specDraft, setSpecDraft] = useState('')
   const [previewRunId, setPreviewRunId] = useState<string | null>(null)
   // Per-section editable specs (parsed/split from specDraft)
@@ -613,12 +650,16 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
   // longer current can discard its result (e.g. user changed model dropdown mid-call).
   const proposeIntentRef = useRef<string | null>(null)
 
-  async function previewSpecs() {
+  async function previewSpecs(opts?: { initialSpecsOverride?: string }) {
     if (!sourceId || selectedTables.size === 0) return
     const intent = `${selectedModel}|${sourceId}|${[...selectedTables].sort().join(',')}`
     proposeIntentRef.current = intent
     const modelAtCall = selectedModel
-    setError(null); setBusy(true); setBusyMsg(`Reading source schemas and asking ${modelAtCall ?? 'AI'} to propose a spec...`)
+    const initialSpecsToSend = opts?.initialSpecsOverride !== undefined ? opts.initialSpecsOverride : initialSpecs
+    setError(null); setBusy(true)
+    setBusyMsg(initialSpecsToSend
+      ? `Processing your initial specs + asking ${modelAtCall ?? 'AI'} to flesh out the full 7-section spec…`
+      : `Reading source schemas and asking ${modelAtCall ?? 'AI'} to propose a spec...`)
     try {
       const { fabric, onelake } = await ensureToken()
       const resp = await api<{ markdown: string; runId: string; targetLakehouseName: string }>(
@@ -628,6 +669,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
             sourceLakehouseId: sourceId,
             tables: Array.from(selectedTables),
             targetLakehouseName: targetName || null,
+            initialSpecs: initialSpecsToSend || null,
             model: modelAtCall
           })
         }, onelake)
@@ -652,6 +694,16 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
     finally {
       if (proposeIntentRef.current === intent) { setBusy(false); setBusyMsg('') }
     }
+  }
+
+  // Explicit "Process Specs" click: send the user's initial-specs textarea to the LLM
+  // proposer so it produces a full 7-section spec built AROUND the user's intent + the
+  // discovered source schemas. Forces a re-run even if a spec already exists.
+  async function processInitialSpecs() {
+    if (!initialSpecs.trim()) return
+    // Reset the auto-propose dedup key so the in-flight stale-guard doesn't block this call.
+    autoProposedForKeyRef.current = null
+    await previewSpecs({ initialSpecsOverride: initialSpecs })
   }
 
   // Auto-propose: as soon as the user has chosen a model + source + at least one table,
@@ -1117,9 +1169,42 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           ) : (
             <div className={s.row}>
               <Label htmlFor="tn">Target Lakehouse name (creates new)</Label>
-              <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(leave empty — auto-generated when you click Build)" disabled={!!run} />
+              <Input id="tn" value={targetName} onChange={(_, d) => setTargetName(d.value)} placeholder="(type a name to use it — or leave empty for an auto-generated one)" disabled={!!run} />
             </div>
           )}
+        </Card>
+      )}
+
+      {/* Section 3.5 — Initial specs (optional).
+          Lets the user paste free-form business intent ("I want a finance reporting solution
+          with monthly revenue trends and a dim_account that consolidates these source codes…")
+          and have the LLM produce a properly-structured 7-section spec around it, grounded in
+          the actual source schemas. The auto-propose effect still runs in the background for
+          users who want a zero-click flow; this section is for users who want to steer the
+          proposal up-front. */}
+      {effectivelySignedIn && sourceId && selectedTables.size > 0 && (
+        <Card>
+          <CardHeader
+            header={<Title3>3.5 Initial specs (optional)</Title3>}
+            description={<Body1>Paste any business intent, modelling preferences, or special rules here. Click <b>Process Specs</b> and the LLM will turn it into a full 7-section spec (Generic / Bronze / Silver / Gold / Semantic / Report / Data Agent) using your initial specs + the actual source schemas + the Lakehouse name you typed above.</Body1>}
+          />
+          <div className={s.row} style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+            <Textarea
+              value={initialSpecs}
+              onChange={(_, d) => setInitialSpecs(d.value)}
+              placeholder={`Examples:\n  - "Build a sales dashboard with month-over-month growth on dim_product[category]."\n  - "Customers should be deduped on email_lower, keeping the most recent modified_date."\n  - "Treat all '_id' columns as integer keys; dim_date is NOT needed (use fact_sales[order_date] directly)."\n\nLeave empty if you don't have specific requirements — the LLM will just propose from the schemas.`}
+              rows={6}
+              disabled={!!run || busy}
+              resize="vertical"
+            />
+            <div className={s.row}>
+              <Button appearance="primary" disabled={busy || !initialSpecs.trim() || !!run} onClick={processInitialSpecs}>
+                ✨ Process Specs
+              </Button>
+              {busy && busyMsg && <Spinner size="tiny" label={busyMsg} />}
+              {!initialSpecs.trim() && <Caption1>Type some intent above to enable — or skip and use the auto-proposed spec in section 4.</Caption1>}
+            </div>
+          </div>
         </Card>
       )}
 
@@ -1133,7 +1218,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
           ) : (
             <>
               <div className={s.row}>
-                <Button disabled={busy} onClick={previewSpecs} icon={<span>✨</span>}>
+                <Button disabled={busy} onClick={() => previewSpecs()} icon={<span>✨</span>}>
                   Re-propose with AI (overwrites edits)
                 </Button>
                 <Caption1>or click any section below to edit it directly</Caption1>

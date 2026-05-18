@@ -477,7 +477,7 @@ Produce the JSON for the {layer} notebook now.";
     /// </summary>
     public async Task<string?> ProposeSpecAsync(string runId, string workspaceId, string sourceLakehouseName,
         string sourceLakehouseId, List<string> sourceTables, string targetLakehouseName,
-        IReadOnlyDictionary<string, string>? tableSchemas = null, string? model = null)
+        IReadOnlyDictionary<string, string>? tableSchemas = null, string? model = null, string? initialSpecs = null)
     {
         if (!_llm.Configured) return null;
         var system = $@"You are a senior Microsoft Fabric data architect. Given the user's selected source tables AND their actual column schemas, produce a complete medallion build spec. The output is shown to the user in 5 editable sections — keep that structure intact.
@@ -576,6 +576,18 @@ INTENT OVER DETAILED COLUMN LISTS (IMPORTANT):
                     : $"- `{t}`\n    columns: (could not introspect)"))
             : string.Join("\n", sourceTables.Select(t => $"- `{t}`"));
 
+        var initialSpecsBlock = string.IsNullOrWhiteSpace(initialSpecs)
+            ? ""
+            : $@"
+
+## USER-PROVIDED INITIAL SPECS (HIGHEST PRIORITY)
+The user has explicitly provided the following intent / requirements for this build. Treat this as the PRIMARY source of design intent. Your generated spec must satisfy every point below, and where it implies modelling choices (specific dim/fact names, dedup keys, measures, report visuals, agent persona…), bake them in concretely rather than offering alternatives. If anything in the initial specs CONTRADICTS what the schemas allow (e.g. user asks to dedup by 'email_lower' but no email column exists), call that out IN the spec under the relevant section (e.g. ""## Silver — NOTE: requested dedup on email_lower is not directly possible; falling back to ... unless the user clarifies"") rather than silently ignoring.
+
+```
+{initialSpecs!.Trim()}
+```
+";
+
         var user = $@"## Run parameters
 runId: {runId}
 workspace_id: {workspaceId}
@@ -584,8 +596,8 @@ target_lakehouse: {targetLakehouseName}
 
 ## Source tables WITH ACTUAL SCHEMAS
 {schemaSection}
-
-Produce the spec markdown now. Base every modeling decision on the columns above — do not assume any specific known data model.";
+{initialSpecsBlock}
+Produce the spec markdown now. Base every modeling decision on the columns above AND the user-provided initial specs (if any). Do not assume any specific known data model.";
 
         try
         {
