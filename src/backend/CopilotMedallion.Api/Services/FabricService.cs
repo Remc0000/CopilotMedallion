@@ -191,22 +191,45 @@ public class FabricService
                     using var doc = JsonDocument.Parse(raw);
                     if (doc.RootElement.TryGetProperty("paths", out var paths))
                     {
-                        // Path entries look like 'Tables/silver/customer/_delta_log'; we take the
-                        // segment between the schema prefix and '/_delta_log' as the table name.
+                        // OneLake DFS returns 'name' paths that can come in any of these forms
+                        // depending on the API version and `directory` query interpretation:
+                        //   - 'Tables/<prefix>/<table>/_delta_log'    (full path with Tables/ prefix)
+                        //   - '<prefix>/<table>/_delta_log'           (relative to lakehouse root)
+                        //   - '<table>/_delta_log'                    (relative to the requested directory)
+                        // The OLD matcher required 'Tables/<prefix>/' to appear literally, which
+                        // returned an empty list for the second and third shapes and caused the
+                        // build to hard-fail ("Bronze produced no discoverable tables") even
+                        // though Bronze had successfully written them. We now extract the table
+                        // name from ANY of those layouts.
                         var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        var px = prefix.TrimEnd('/'); // e.g. "bronze"
                         foreach (var p in paths.EnumerateArray())
                         {
                             var name = p.TryGetProperty("name", out var nm) ? nm.GetString() ?? "" : "";
                             if (!name.EndsWith("/_delta_log")) continue;
-                            var tableRoot = name[..^"/_delta_log".Length];
-                            var marker = $"Tables/{prefix}";
-                            var idx = tableRoot.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-                            if (idx < 0) continue;
-                            var rel = tableRoot.Substring(idx + "Tables/".Length); // 'silver/customer'
+                            var root = name[..^"/_delta_log".Length].Trim('/');
+                            // Strip optional leading 'Tables/Tables/', 'Tables/', or '<lakehouseId>/Tables/...'
+                            // so we land on '<prefix>/<table>' or '<table>'.
+                            var lhMarker = $"{lakehouseId}/Tables/";
+                            var lhIdx = root.IndexOf(lhMarker, StringComparison.OrdinalIgnoreCase);
+                            if (lhIdx >= 0) root = root.Substring(lhIdx + lhMarker.Length);
+                            else if (root.StartsWith("Tables/Tables/", StringComparison.OrdinalIgnoreCase)) root = root["Tables/Tables/".Length..];
+                            else if (root.StartsWith("Tables/", StringComparison.OrdinalIgnoreCase)) root = root["Tables/".Length..];
+                            if (string.IsNullOrEmpty(root)) continue;
+                            // Now root is one of: '<prefix>/<table>' or '<table>'. Normalise to '<prefix>/<table>'.
+                            string rel;
+                            if (root.StartsWith(px + "/", StringComparison.OrdinalIgnoreCase))
+                                rel = root; // already has prefix
+                            else if (root.Contains('/'))
+                                continue; // some other schema namespace — not ours
+                            else
+                                rel = $"{px}/{root}"; // bare table name → prepend the prefix we asked for
                             found.Add(rel);
                         }
                         tables = found.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
-                        break;
+                        _log.LogInformation("DiscoverLayerTablesAsync ws={ws} lh={lh} prefix={p} attempt={a} found {n} tables: {tables}",
+                            workspaceId, lakehouseId, schemaPrefix, attempt + 1, tables.Count, string.Join(",", tables));
+                        if (tables.Count > 0) break;
                     }
                 }
                 _log.LogDebug("DiscoverLayerTablesAsync attempt {a} got {s} for ws={ws} lh={lh} prefix={p}",

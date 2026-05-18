@@ -62,6 +62,39 @@ Rule G — Optional-column helpers must return typed Column nulls, not Python No
   ```
   Either approach is acceptable, but **never pass Python `None` directly into a Spark function**.
 - Applies to ALL optional-column lookups across Bronze, Silver, Gold — including audit-timestamp coalesces, optional-key joins, fallback string formatting, etc. This is a layer-agnostic rule.
+
+Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
+- Spark cancels the entire session when one statement crashes. If your notebook builds a single chained plan that touches every source table (one big SELECT, one big DataFrame, one big SQL script), any one table's failure kills ALL tables.
+- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover. Wrap the loop body in `try/except` that calls `_save_error(layer, e, table=tbl)` and APPENDS the failure to a results dict, then **re-raises only AFTER the loop has attempted all tables** (or, if your spec says ""fail-fast-first-table"", re-raise immediately — but per-table-isolated by default).
+- Do NOT build a single multi-CTE Spark SQL statement that joins/transforms many source tables in one shot. Each table's transform is its own DataFrame chain with its own `.write` call.
+- Do NOT share intermediate temp views across tables. Temp views from one iteration must not be assumed to exist in the next. If you need cross-table joins (typical for Gold), do them in a SECOND loop AFTER all per-table Silver/Gold writes are complete.
+
+Rule I — Optional audit columns on junction / bridge / view tables.
+- In typical operational sources (AdventureWorksLT, Northwind, AdventureWorks2019, etc.), entity tables (Customer, Product, SalesOrderHeader) have system audit columns: `ModifiedDate`, `rowguid`. **Junction / bridge tables** (CustomerAddress, ProductModelProductDescription, SalesTerritoryHistory) typically have only the FK columns and may have NO ModifiedDate and NO rowguid. **Views** (vGetAllCategories, vProductAndDescription) may have whatever columns the underlying query projects — frequently NO audit columns.
+- When you write Silver dedup / tie-break / audit logic, you MUST NOT assume `modified_date` (or any other audit column) exists on every table. Use `'modified_date' in df.columns` as a guard and fall back to:
+  - For dedup: a deterministic ranking expression that uses only the natural-key columns (`row_number().over(Window.partitionBy(*pk_cols).orderBy(*pk_cols))`), OR a literal F.lit(timestamp).
+  - For `source_dt` / `_silver_ts`: a typed null literal (`F.lit(None).cast('timestamp')`) or `F.current_timestamp()`.
+- Junction tables: dedupe on the COMPOSITE FK key (e.g. `(customer_id, address_id, address_type)`) — never on a non-existent surrogate key.
+- View tables: project ONLY the columns actually returned by the view. Do not assume any standard naming.
+
+Rule J — Validate column existence BEFORE the expensive transform.
+- For every join, withColumn, groupBy, agg, or filter that names a specific column, ASSERT the column exists in `df.columns` BEFORE the line that uses it. Pattern:
+  ```
+  for required in ('customer_id', 'order_date'):
+      if required not in df.columns:
+          raise RuntimeError(f""[{layer}] {tbl}: required column '{required}' missing; available={df.columns}"")
+  # … now the join / withColumn that uses customer_id and order_date
+  ```
+- Catches missing-column bugs in a SPECIFIC cell with a SPECIFIC table name, instead of a session-wide Spark cancellation 30 minutes later that the auto-fixer can't pinpoint.
+- Especially important AFTER a select(), drop(), or rename() — re-validate before the next consumer of those columns.
+
+Rule K — Resilience to partial output: Bronze MUST write Delta tables that the next layer can discover.
+- The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs ""successfully"" (Spark Completed) but writes zero discoverable tables under `Tables/bronze/`, the build hard-fails with ""prior layer produced no discoverable tables"".
+- To guarantee discoverability, the Bronze notebook MUST:
+  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).save(f""{tgt_base}/Tables/bronze/<flat>"")` for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`.
+  - Print a final summary line `print(json.dumps({{""bronze_results"": {{<table>: {{""rows"": N, ""path"": ...}}, ...}}}}))` listing every table actually written. Use this as a self-check.
+  - Raise (not just log) if zero tables were written by the end of the notebook.
+- Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
 ";
 
     public NotebookBuilder(LlmService llm, IHttpClientFactory http, ILogger<NotebookBuilder> log)
