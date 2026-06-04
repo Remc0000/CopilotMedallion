@@ -36,8 +36,13 @@ public class LlmService
     public string DefaultModel => _defaultDeployment;
     public IReadOnlyList<string> AvailableModels => _availableModels;
 
+    // Models that require the newer chat-completions parameter style:
+    // `max_completion_tokens` instead of `max_tokens`, and no temperature override
+    // (only the default of 1 is accepted). Covers gpt-5 / o-series reasoning models
+    // as well as gpt-chat-latest.
     private static bool IsReasoningModel(string deployment) =>
         deployment.StartsWith("gpt-5", StringComparison.OrdinalIgnoreCase)
+        || deployment.StartsWith("gpt-chat", StringComparison.OrdinalIgnoreCase)
         || deployment.StartsWith("o1", StringComparison.OrdinalIgnoreCase)
         || deployment.StartsWith("o3", StringComparison.OrdinalIgnoreCase)
         || deployment.StartsWith("o4", StringComparison.OrdinalIgnoreCase);
