@@ -383,7 +383,11 @@ public class FabricService
                     : "?";
                 parts.Add($"{name}:{type}");
             }
-            return string.Join(", ", parts);
+            // Join columns with " | " (NOT ", ") because a column TYPE can itself contain a
+            // comma — e.g. decimal(10,2), array<...>, struct<a:int,b:int>. A comma separator
+            // makes the summary ambiguous and tempts downstream code into a broken
+            // `summary.split(',')` that splits decimal(10,2) into 'decimal(10' + '2)'.
+            return string.Join(" | ", parts);
         }
         catch (Exception ex)
         {
