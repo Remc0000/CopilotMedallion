@@ -49,6 +49,12 @@ public class RunUsageTracker
     private static readonly Dictionary<string, (decimal Input, decimal Output)> Pricing =
         new(StringComparer.OrdinalIgnoreCase)
         {
+            // gpt-chat-latest is the app's default deployment; the LLM service groups it with the
+            // gpt-5 family, so it is priced the same here. Adjust if your Foundry deployment maps
+            // to a different underlying model. The "gpt-chat" prefix catches any gpt-chat-* variant
+            // via the StartsWith fallback in EstimateCost.
+            ["gpt-chat-latest"] = (5.00m,  15.00m),
+            ["gpt-chat"]        = (5.00m,  15.00m),
             ["gpt-5.4"]       = (5.00m,  15.00m),
             ["gpt-5.3-codex"] = (5.00m,  15.00m),
             ["gpt-5"]         = (5.00m,  15.00m),
