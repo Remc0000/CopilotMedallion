@@ -532,7 +532,12 @@ public class FabricService
             var body = new {
                 displayName = name,
                 description = description ?? "",
-                creationPayload = new { enableSchemas = true }
+                // The medallion notebooks use a CLASSIC folder-based layout
+                // (Tables/bronze/<t>, Tables/silver/<t>, Tables/gold/<t>, Tables/test/test_results)
+                // and discovery parses Tables/<prefix>/<table>. Schema-enabled lakehouses use a
+                // Tables/<schema>/<table> namespace, so raw abfss .save() writes land at a broken
+                // Tables/Tables/bronze/... path the SQL endpoint and discovery can't see. Keep schemas OFF.
+                creationPayload = new { enableSchemas = false }
             };
             var resp = await c.PostAsync($"workspaces/{ws}/lakehouses",
                 new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
@@ -671,6 +676,25 @@ public class FabricService
                                  e.GetProperty("displayName").GetString()!,
                                  ws,
                                  e.TryGetProperty("description", out var d) ? d.GetString() : null);
+    }
+
+    /// <summary>
+    /// Returns true if the lakehouse is schema-enabled (Tables/&lt;schema&gt;/&lt;table&gt; namespace).
+    /// The medallion notebooks use the classic folder layout (Tables/bronze/&lt;t&gt; ...), which is
+    /// incompatible with schema-enabled lakehouses, so the build guards against it up front.
+    /// </summary>
+    public async Task<bool> IsLakehouseSchemaEnabledAsync(string userToken, string lakehouseId, string? workspaceId = null)
+    {
+        var ws = ResolveWorkspaceId(workspaceId);
+        var c = Client(userToken);
+        var resp = await c.GetAsync($"workspaces/{ws}/lakehouses/{lakehouseId}");
+        if (!resp.IsSuccessStatusCode) return false; // best-effort: don't block on a transient read error
+        var json = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        return doc.RootElement.TryGetProperty("properties", out var props)
+            && props.TryGetProperty("defaultSchema", out var ds)
+            && ds.ValueKind == JsonValueKind.String
+            && !string.IsNullOrEmpty(ds.GetString());
     }
 
     public async Task<LakehouseInfo?> FindLakehouseByNameAsync(string userToken, string displayName, string? workspaceId = null)
