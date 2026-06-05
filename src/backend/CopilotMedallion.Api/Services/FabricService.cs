@@ -183,7 +183,14 @@ public class FabricService
         {
             try
             {
-                var url = $"https://onelake.dfs.fabric.microsoft.com/{workspaceId}/{lakehouseId}/?resource=filesystem&recursive=true&directory=Tables/{schemaPrefix.TrimEnd('/')}";
+                // IMPORTANT: the filesystem is the WORKSPACE; the lakehouse id must live INSIDE the
+                // `directory` value (not as a path segment before '?'). The old form
+                // '{ws}/{lh}/?directory=Tables/<prefix>' makes OneLake echo the directory back as a
+                // prefix on already-lakehouse-relative names, producing DOUBLED paths like
+                // 'Tables/bronze/Tables/bronze/address/_delta_log'. That yields bogus table keys
+                // ('bronze/Tables/bronze/address'), whose schema read then hits a non-existent path,
+                // drops every table, and makes the layer hard-fail with "no discoverable tables".
+                var url = $"https://onelake.dfs.fabric.microsoft.com/{workspaceId}?resource=filesystem&recursive=true&directory={lakehouseId}/Tables/{schemaPrefix.TrimEnd('/')}";
                 var resp = await hc.GetAsync(url);
                 if (resp.IsSuccessStatusCode)
                 {
