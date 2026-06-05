@@ -95,6 +95,13 @@ Rule K — Resilience to partial output: every layer MUST write Delta tables the
   - Print a final summary line `print(json.dumps({{""bronze_results"": {{<table>: {{""rows"": N, ""path"": ...}}, ...}}}}))` listing every table actually written. Use this as a self-check.
   - Raise (not just log) if zero tables were written by the end of the notebook.
 - Same rule applies recursively to Silver (`silver.<table>`) and Gold (`gold.<table>` + `test.test_results`) — each via `CREATE SCHEMA IF NOT EXISTS` + saveAsTable.
+
+Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFERENCE).
+- When you `select(...)` directly off a join whose sides share a column name, selecting that column as a BARE string raises `[AMBIGUOUS_REFERENCE]` and cancels the whole Spark session. Typical Gold offenders: joining product `p` with product_model `m` (both expose `product_model_id`), or product `p` with product_category `pc` (both expose `product_category_id`), or any dimension built from several aliased source tables that carry the same key.
+- Inside the SAME join+select expression the alias scope is still live, so reference EVERY shared/overlapping column with its alias and rename it explicitly: `F.col('p.product_model_id').alias('product_model_id')`, `F.col('pc.parent_product_category_id').alias('category_id')`. A bare string in a join `select` is ONLY safe for a column that exists on EXACTLY ONE side of the join.
+- Before emitting a join's select list, enumerate the columns on each side; for any name present on more than one side, alias-qualify the side you want. When in doubt in a multi-table join, alias-qualify ALL columns in the select list — it is always safe and never ambiguous.
+- This is the in-join counterpart to Rule A: dotted alias references (`F.col('p.col')`) are valid ONLY inside the join/select that introduces the alias; once the joined DataFrame has been materialized by that select, switch back to plain, already-renamed column names (Rule A).
+- Concrete failure to avoid: `.select(F.col('p.product_id').alias('product_id'), 'product_number', 'product_model_id', ...)` after `p.join(m, ...)` — `product_model_id` exists on both `p` and `m`, so it MUST be `F.col('p.product_model_id').alias('product_model_id')` (or the `m.` side), never the bare `'product_model_id'`.
 ";
 
     public NotebookBuilder(LlmService llm, IHttpClientFactory http, ILogger<NotebookBuilder> log)
@@ -400,11 +407,23 @@ Produce the JSON now.";
 - Define a defensive _fabric_post(path, body) helper that returns None on non-2xx or caught exceptions. EVERY caller MUST do `if x is None: raise RuntimeError(...)` BEFORE `.get('id')`.
 - Item naming derived from target_lakehouse_name: '<name>_sm' (SemanticModel), '<name>_rpt' (Report), '<name>_agent' (AISkill).
 - 1) GET /lakehouses/{target_lakehouse_id} and poll until properties.sqlEndpointProperties.provisioningStatus == 'Success' (up to 5 min). Capture connectionString and the SQL endpoint id.
-- 2) POST /items to create a Direct Lake SemanticModel (TMSL model.bim, compatibilityLevel 1604) with one table per discovered gold table (use the actual columns), relationships (per spec), explicit measures (per spec, PascalCase, with FORMAT strings). The TARGET LAKEHOUSE IS SCHEMA-ENABLED: each table's Direct Lake partition entity MUST set its source schema from the prior_layer_schemas KEY PREFIX — a 'gold/<table>' key uses schemaName='gold', and if you include the data-quality table its 'test/test_results' key uses schemaName='test' (entityName='test_results'). NEVER use 'dbo' and NEVER apply schemaName='gold' to a non-gold table. payloadType='InlineBase64', payload=base64(utf-8(json.dumps(tmsl_obj))), path='model.bim'.
+- 2) Build the TMSL `model.bim` for a Direct Lake SemanticModel and POST it to /items. Get these EXACTLY right — the Fabric items API rejects a malformed model.bim with HTTP 400 and the notebook then raises a generic 'Semantic model creation failed':
+   a) model.bim MUST be the raw TOM database object: {""name"":""<name>_sm"",""compatibilityLevel"":1604,""model"":{""tables"":[...],""relationships"":[...],""expressions"":[...]}}. Do NOT wrap it in ""createOrReplace"" / ""database"" — that is an XMLA/TMSL command envelope, NOT a definition file, and is rejected.
+   b) Direct Lake REQUIRES a shared data-source M expression. Add model.expressions = [{""name"":""DatabaseQuery"",""kind"":""m"",""expression"":""let Source = Sql.Database(\""<connectionString>\"", \""<sqlDbName>\"") in Source""}] using the connectionString captured in step 1 and the SQL endpoint database name (use target_lakehouse_name as <sqlDbName>). EVERY table partition MUST reference it via expressionSource.
+   c) Each table = {""name"":<table>,""columns"":[...],""partitions"":[{""name"":""DL"",""mode"":""directLake"",""source"":{""type"":""entity"",""entityName"":<table>,""schemaName"":<schema-from-key-prefix>,""expressionSource"":""DatabaseQuery""}}]}.
+   d) EVERY column MUST have ""name"", ""dataType"" AND ""sourceColumn"" (sourceColumn == the physical Delta column name). Map the discovered Delta type → TMSL dataType: string→""string""; int/integer/long/bigint→""int64""; decimal/double/float→""double""; boolean→""boolean""; timestamp/date/datetime→""dateTime"". A column with only a name is REJECTED.
+   e) Schema per key prefix: 'gold/<t>' → schemaName='gold'; the data-quality 'test/test_results' → schemaName='test', entityName='test_results'. NEVER 'dbo'; never apply 'gold' to a non-gold table.
+   f) Measures (PascalCase, with formatString) go on the fact table ONLY; every column a DAX measure references must exist as a sourceColumn on that table.
+   g) payloadType='InlineBase64', payload=base64(utf-8(json.dumps(model_bim))), path='model.bim'.
+   h) For THIS create call do NOT swallow the failure: capture the HTTP status code AND response text and include them in the raised error (e.g. `raise RuntimeError(f'Semantic model creation failed: {resp.status_code} {resp.text}')`) so the auto-fixer sees the REAL API error instead of a generic message. (The defensive None-returning helper is fine for the report/agent steps, but the SemanticModel create must surface status+body.)
 - 3) POST /items to create a Report (PBIR format) bound to the new SemanticModel id, with at least one page that uses the explicit measures.
 - 4) POST /items to create an AISkill data agent. Wrap in try/except so AISkill being preview-only never crashes the notebook.
-- 5) Print a final JSON summary line with semantic_model_id, report_id, data_agent_id (or null).
-- Hard-fail (raise) on the SemanticModel step's failure; reporting/agent steps may degrade gracefully.",
+- 5) FINAL TEST — verify the serving layer actually works (this is a real functional gate, not just creation). Collect rows into a validation_results list and APPEND them to test.test_results (same schema as the gold tests: run_id, test_name, layer='reporting', table_name, status PASS/FAIL/ERROR, actual, expected, details, checked_at=F.current_timestamp via a small spark.createDataFrame) so the build's unified test table records serving-layer health. Run these checks, EACH in its own try/except producing a PASS/FAIL/ERROR row (never an uncaught crash inside a check):
+  a) Semantic model is QUERYABLE (the core Direct Lake gate): POST https://api.powerbi.com/v1.0/myorg/datasets/{semantic_model_id}/executeQueries with a pbi token (notebookutils.credentials.getToken('pbi')) and body {""queries"":[{""query"":""EVALUATE TOPN(1, '<fact_table_name>')""}],""serializerSettings"":{""includeNulls"":true}}. status 200 with a results array → PASS; otherwise FAIL with status+body. Poll/retry up to ~5 times with a short sleep because Direct Lake models need a moment to become queryable after creation.
+  b) Report exists & is bound: GET /items/{report_id} returns 200 → PASS.
+  c) Data agent works: GET /items/{data_agent_id} returns 200 → PASS (existence). If a data-agent query/evaluation endpoint is available, send one trivial question in try/except and record PASS/FAIL; AISkill is preview, so a failure here is recorded as FAIL but DOES NOT raise.
+- 6) Print a final JSON summary line with semantic_model_id, report_id, data_agent_id (or null) AND a validation object {semantic_model_queryable, report_ok, data_agent_ok}.
+- Hard-fail (raise RuntimeError) ONLY if the SemanticModel could not be created OR the semantic-model query test (5a) FAILED — those mean the serving layer is not working. Report/agent existence and the data-agent functional test degrade gracefully (FAIL rows + printed summary, no raise).",
             _ => throw new InvalidOperationException()
         };
 
@@ -560,7 +579,7 @@ Apply these reference skills/agents at all times:
 
 THEN include the standard cross-cutting code rules: defensive column references, alias-prefixed joins after every join, groupBy/agg column existence assertion, defensive REST handling with `if x is None: raise` BEFORE `.get()`, schema-qualified `saveAsTable('<schema>.<table>')` writes (after `CREATE SCHEMA IF NOT EXISTS`) into bronze/silver/gold/test — NEVER raw abfss `.save()` on the schema-enabled target lakehouse, parameter cells, idempotent overwrite patterns, error-loud try/except that calls `_save_error(layer, e)` and re-raises.
 
-THEN include the following ""Global Spark column-reference rules"" subsection VERBATIM (copy the entire block below into the Generic guidance section, preserving headings, bullets, and rule labels A–F exactly as written — do not paraphrase, abbreviate, or reorder):
+THEN include the following ""Global Spark column-reference rules"" subsection VERBATIM (copy the entire block below into the Generic guidance section, preserving headings, bullets, and rule labels A–L exactly as written — do not paraphrase, abbreviate, or reorder):
 
 {GlobalSparkColumnRules}
 

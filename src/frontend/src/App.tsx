@@ -156,7 +156,8 @@ type BuildStep = {
   title: string
   sub?: string
   state: 'pending' | 'active' | 'done' | 'failed'
-  indent?: boolean
+  /** Indentation depth: 0 = top level, 1 = child, 2 = grandchild (sub-phase). */
+  indent?: number
 }
 
 function openExternal(url: string) {
@@ -234,40 +235,124 @@ function statusToSteps(status: string, run: Run, model: string | null): BuildSte
     if (['CreatingLakehouse','ReusingLakehouse'].includes(s)) return 'active'
     return hasLh ? 'done' : 'pending'
   })()
-  const genState: BuildStep['state'] = (() => {
+  // Resolve which layer + phase (create/deploy/run) is currently active from the status string.
+  // Discovery statuses are treated as the "create" phase of the layer about to be generated.
+  type Phase = 'create' | 'deploy' | 'run'
+  const phaseOrder: Phase[] = ['create', 'deploy', 'run']
+  let activeLayer: Layer | null = null
+  let activePhase: Phase | null = null
+  {
+    const mGen = s.match(/^Generating(Bronze|Silver|Gold|Reporting)Notebook$/)
+    const mDep = s.match(/^Deploying(Bronze|Silver|Gold|Reporting)$/)
+    const mRun = s.match(/^Running(Bronze|Silver|Gold|Reporting)$/)
+    const mDisc = s.match(/^Discovering(Bronze|Silver|Gold)Schemas$/)
+    if (mGen) { activeLayer = mGen[1].toLowerCase() as Layer; activePhase = 'create' }
+    else if (mDep) { activeLayer = mDep[1].toLowerCase() as Layer; activePhase = 'deploy' }
+    else if (mRun) { activeLayer = mRun[1].toLowerCase() as Layer; activePhase = 'run' }
+    else if (s === 'DiscoveringSourceSchemas') { activeLayer = 'bronze'; activePhase = 'create' }
+    else if (mDisc) {
+      const prior = mDisc[1].toLowerCase()
+      activeLayer = (prior === 'bronze' ? 'silver' : prior === 'silver' ? 'gold' : 'reporting') as Layer
+      activePhase = 'create'
+    }
+  }
+  const activeIdx = activeLayer ? layerOrder[activeLayer] : -1
+
+  // Map a single phase marker to the three phase rows of a layer (earlier=done, marker=st, later=pending).
+  const phasesWith = (phase: Phase, st: BuildStep['state']): Record<Phase, BuildStep['state']> => {
+    const pi = phaseOrder.indexOf(phase)
+    return {
+      create: pi > 0 ? 'done' : st,
+      deploy: pi > 1 ? 'done' : pi === 1 ? st : 'pending',
+      run: pi === 2 ? st : 'pending',
+    }
+  }
+  const layerPhases = (layer: Layer): Record<Phase, BuildStep['state']> => {
+    const idx = layerOrder[layer]
+    const hasNb = layer === 'bronze' ? hasBronzeNb : layer === 'silver' ? hasSilverNb : layer === 'gold' ? hasGoldNb : hasReportingNb
+    const hasJob = layer === 'bronze' ? hasBronzeJob : layer === 'silver' ? hasSilverJob : layer === 'gold' ? hasGoldJob : hasReportingJob
+    if (succeeded) return { create: 'done', deploy: 'done', run: 'done' }
+    if (failed && run.currentLayer === layer) {
+      // Infer where it died from the recorded ids: no notebook -> create, notebook but no job -> deploy, else run.
+      const fp: Phase = !hasNb ? 'create' : !hasJob ? 'deploy' : 'run'
+      return phasesWith(fp, 'failed')
+    }
+    if (activeLayer === layer && activePhase) return phasesWith(activePhase, 'active')
+    if (activeIdx >= 0 && activeIdx > idx) return { create: 'done', deploy: 'done', run: 'done' }
+    if (activeIdx >= 0 && activeIdx < idx) return { create: 'pending', deploy: 'pending', run: 'pending' }
+    if (hasJob) return { create: 'done', deploy: 'done', run: 'done' }
+    return { create: 'pending', deploy: 'pending', run: 'pending' }
+  }
+
+  // Roll-up state for the "Analytics Engineering" parent (covers bronze/silver/gold).
+  const aeState: BuildStep['state'] = (() => {
     if (succeeded) return 'done'
-    if (s === 'GeneratingNotebook') return 'active'
-    return (hasBronzeNb || hasSilverNb || hasGoldNb || hasReportingNb) ? 'done' : 'pending'
+    if (failed && ['bronze', 'silver', 'gold'].includes(run.currentLayer ?? '')) return 'failed'
+    if (activeLayer && ['bronze', 'silver', 'gold'].includes(activeLayer)) return 'active'
+    if (layerState('gold') === 'done' || activeLayer === 'reporting' || hasReportingNb) return 'done'
+    if (hasBronzeNb || hasSilverNb || hasGoldNb) return 'active'
+    return 'pending'
   })()
+  const reportingState = layerState('reporting')
 
   const lakehouseShortName = (() => {
     if (!run.targetLakehouseName) return 'medallion'
     return run.targetLakehouseName.replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'medallion'
   })()
 
-  return [
+  const steps: BuildStep[] = [
     { key: 'lh', title: s === 'ReusingLakehouse' ? 'Reusing target Lakehouse' : 'Creating target Lakehouse',
       sub: run.targetLakehouseName ?? undefined,
       state: lakehouseState },
-    { key: 'gen', title: 'Generating notebook cells with the LLM',
-      sub: model ? `Model: ${model} · one call produces cells for all 4 layers` : 'One LLM call produces cells for all 4 layers',
-      state: genState },
-    { key: 'bronze', title: 'Bronze layer notebook (deploy + run)',
-      sub: run.bronzeNotebookId ? `${lakehouseShortName}_bronze` : undefined,
-      state: layerState('bronze'), indent: true },
-    { key: 'silver', title: 'Silver layer notebook (deploy + run)',
-      sub: run.silverNotebookId ? `${lakehouseShortName}_silver` : undefined,
-      state: layerState('silver'), indent: true },
-    { key: 'gold', title: 'Gold layer notebook (+ data quality tests)',
-      sub: run.goldNotebookId ? `${lakehouseShortName}_gold` : undefined,
-      state: layerState('gold'), indent: true },
-    { key: 'reporting', title: 'Reporting notebook (semantic model + report + data agent)',
-      sub: run.reportingNotebookId ? `${lakehouseShortName}_reporting` : undefined,
-      state: layerState('reporting'), indent: true },
-    { key: 'done', title: 'Done',
-      sub: succeeded ? 'All tables written; reports created' : undefined,
-      state: succeeded ? 'done' : 'pending' }
+    { key: 'gen', title: 'Analytics Engineering',
+      sub: model ? `Model: ${model}` : undefined,
+      state: aeState },
   ]
+
+  // Bronze / Silver / Gold each become a parent row with Create / Deploy / Run sub-phases.
+  const aeLayers: { layer: Layer; title: string; nb?: string }[] = [
+    { layer: 'bronze', title: 'Bronze layer notebook', nb: run.bronzeNotebookId ? `${lakehouseShortName}_bronze` : undefined },
+    { layer: 'silver', title: 'Silver layer notebook', nb: run.silverNotebookId ? `${lakehouseShortName}_silver` : undefined },
+    { layer: 'gold', title: 'Gold layer notebook', nb: run.goldNotebookId ? `${lakehouseShortName}_gold` : undefined },
+  ]
+  for (const { layer, title, nb } of aeLayers) {
+    const ph = layerPhases(layer)
+    steps.push({ key: layer, title, sub: nb, state: layerState(layer), indent: 1 })
+    steps.push({ key: `${layer}-create`, title: 'Create', state: ph.create, indent: 2 })
+    steps.push({ key: `${layer}-deploy`, title: 'Deploy', state: ph.deploy, indent: 2 })
+    steps.push({ key: `${layer}-run`, title: 'Run', state: ph.run, indent: 2 })
+  }
+
+  // Testing is its own top-level stage. The data-quality tests execute inside the gold run,
+  // so this stage mirrors the gold run phase.
+  const goldRunState = layerPhases('gold').run
+  steps.push({ key: 'testing', title: 'Testing',
+    sub: 'Data-quality tests on gold tables',
+    state: succeeded ? 'done' : goldRunState })
+
+  // Serving & Consumption Layer (reporting) sits at the top level with its deliverables indented underneath.
+  steps.push({ key: 'reporting', title: 'Serving & Consumption Layer',
+    sub: run.reportingNotebookId ? `${lakehouseShortName}_reporting` : undefined,
+    state: reportingState })
+  steps.push({ key: 'reporting-semantic', title: 'Semantic model', state: reportingState, indent: 1 })
+  steps.push({ key: 'reporting-report', title: 'Report', state: reportingState, indent: 1 })
+  steps.push({ key: 'reporting-agent', title: 'Data agent', state: reportingState, indent: 1 })
+
+  // Final functional test: confirm the report is queryable and the data agent responds.
+  // This runs as the last cells of the reporting notebook, so it tracks the reporting run.
+  const finalTestState: BuildStep['state'] =
+    succeeded ? 'done' :
+    (failed && run.currentLayer === 'reporting') ? 'failed' :
+    reportingState === 'active' ? 'active' : 'pending'
+  steps.push({ key: 'final-test', title: 'Final test — reports & data agent working',
+    sub: 'Query semantic model + report, ping data agent',
+    state: finalTestState })
+
+  steps.push({ key: 'done', title: 'Done',
+    sub: succeeded ? 'All tables written; reports created' : undefined,
+    state: succeeded ? 'done' : 'pending' })
+
+  return steps
 }
 
 export default function App({ appConfig }: { appConfig: AppConfig }) {
@@ -1419,7 +1504,7 @@ export default function App({ appConfig }: { appConfig: AppConfig }) {
                 st.state === 'active' ? '●' :
                 '○'
               return (
-                <div key={st.key} className={cls} style={st.indent ? { marginLeft: 28, borderLeft: `2px solid ${tokens.colorNeutralStroke2}`, paddingLeft: 12 } : undefined}>
+                <div key={st.key} className={cls} style={st.indent ? { marginLeft: st.indent * 26, borderLeft: `2px solid ${tokens.colorNeutralStroke2}`, paddingLeft: 12 } : undefined}>
                   <div className={s.stepIcon}>
                     {st.state === 'active' ? <Spinner size="extra-tiny" /> : icon}
                   </div>
