@@ -88,13 +88,13 @@ Rule J — Validate column existence BEFORE the expensive transform.
 - Catches missing-column bugs in a SPECIFIC cell with a SPECIFIC table name, instead of a session-wide Spark cancellation 30 minutes later that the auto-fixer can't pinpoint.
 - Especially important AFTER a select(), drop(), or rename() — re-validate before the next consumer of those columns.
 
-Rule K — Resilience to partial output: Bronze MUST write Delta tables that the next layer can discover.
-- The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs ""successfully"" (Spark Completed) but writes zero discoverable tables under `Tables/bronze/`, the build hard-fails with ""prior layer produced no discoverable tables"".
+Rule K — Resilience to partial output: every layer MUST write Delta tables the next layer can discover.
+- The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs ""successfully"" (Spark Completed) but writes zero discoverable tables in the `bronze` schema, the build hard-fails with ""prior layer produced no discoverable tables"".
 - To guarantee discoverability, the Bronze notebook MUST:
-  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).save(f""{tgt_base}/Tables/bronze/<flat>"")` for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`.
+  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).saveAsTable(f""bronze.<flat>"")` (after `spark.sql('CREATE SCHEMA IF NOT EXISTS bronze')`) for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`. NEVER write target tables with abfss `.save(path)` — on this SCHEMA-ENABLED lakehouse a raw .save() to `Tables/bronze/<t>` lands at a broken nested `Tables/Tables/bronze/<t>` path the discovery + SQL endpoint cannot see.
   - Print a final summary line `print(json.dumps({{""bronze_results"": {{<table>: {{""rows"": N, ""path"": ...}}, ...}}}}))` listing every table actually written. Use this as a self-check.
   - Raise (not just log) if zero tables were written by the end of the notebook.
-- Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
+- Same rule applies recursively to Silver (`silver.<table>`) and Gold (`gold.<table>` + `test.test_results`) — each via `CREATE SCHEMA IF NOT EXISTS` + saveAsTable.
 ";
 
     public NotebookBuilder(LlmService llm, IHttpClientFactory http, ILogger<NotebookBuilder> log)
@@ -172,7 +172,7 @@ PLATFORM CONSTRAINTS (apply per notebook):
     Test results  → f""{tgt_base}/Tables/test/test_results"" (schema = 'test', APPEND mode)
   where flat = table_relative_path.split('/')[-1].lower().
 - Schemas (bronze/silver/gold/test) get auto-created by the lakehouse on first write — do NOT issue CREATE SCHEMA statements (they fail against the abfss path API).
-- Always use spark.read.format('delta').load(...) and DataFrame.write.format('delta')...save(...). NEVER use saveAsTable.
+- For target writes, use `spark.sql('CREATE SCHEMA IF NOT EXISTS <schema>')` then `DataFrame.write.format('delta')...saveAsTable('<schema>.<table>')`. Read sources/prior layers with spark.read.format('delta').load(...) or spark.read.table('<schema>.<table>'). NEVER write target tables via raw abfss `.save()` on the schema-enabled lakehouse.
 - Never use credentials/secrets — trust the notebook runtime identity for OneLake access.
 - Per-table read errors MUST cause the JOB TO FAIL (raise/re-raise after logging). Do NOT silently capture errors in a dict and continue.
 
@@ -376,29 +376,31 @@ Produce the JSON now.";
         var layerSpec = layer switch
         {
             "bronze" => @"BRONZE notebook:
-- Loop over source_tables. For each: read from src_base/Tables/<table_relative_path> with spark.read.format('delta'), add metadata columns (ingestion_timestamp, source_path, batch_id=run_id, ingestion_date), write to f'{tgt_base}/Tables/bronze/<flat>' with mode='overwrite' option('overwriteSchema','true') partitioned by ingestion_date. flat = table_relative_path.split('/')[-1].lower().
-- Build a bronze_results dict {table: {rows, path}} and print the summary as JSON at the end.
+- Run spark.sql('CREATE SCHEMA IF NOT EXISTS bronze') once near the top.
+- Loop over source_tables. For each: read from f'{src_base}/Tables/<table_relative_path>' with spark.read.format('delta'), add metadata columns (ingestion_timestamp, source_path, batch_id=run_id, ingestion_date), then write with df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy('ingestion_date').saveAsTable(f'bronze.<flat>'). flat = table_relative_path.split('/')[-1].lower(). NEVER write the target via abfss .save().
+- Build a bronze_results dict {table: {rows, target: 'bronze.<flat>'}} and print the summary as JSON at the end.
 - Hard-fail (raise) on any per-table read or write error after calling _save_error('bronze', e).",
             "silver" => @"SILVER notebook:
 - The 'prior_layer_schemas' provided in the user message tells you the EXACT columns currently sitting in the bronze schema. USE THEM — do not assume; do not invoke F.coalesce/F.greatest etc. with arguments that might be Python None (see Rule G in Generic guidance).
-- Loop over bronze tables. For each: read from f'{tgt_base}/Tables/bronze/<flat>', drop fully-null columns, trim strings, snake_case-rename columns (using a deterministic helper), dedupe on natural key (per spec), add ingestion_dt and source_dt audit columns (use F.lit(None).cast('timestamp') when the source columns are missing — never Python None), add _silver_ts = F.current_timestamp(), write to f'{tgt_base}/Tables/silver/<flat>' mode='overwrite' overwriteSchema=true. After write try OPTIMIZE inside try/except.
+- Run spark.sql('CREATE SCHEMA IF NOT EXISTS silver') once near the top.
+- Loop over bronze tables (keys are 'bronze/<flat>'). For each: read with spark.read.table(f'bronze.<flat>'), drop fully-null columns, trim strings, snake_case-rename columns (using a deterministic helper), dedupe on natural key (per spec), add ingestion_dt and source_dt audit columns (use F.lit(None).cast('timestamp') when the source columns are missing — never Python None), add _silver_ts = F.current_timestamp(), write with df.write.format('delta').mode('overwrite').option('overwriteSchema','true').saveAsTable(f'silver.<flat>'). After write try OPTIMIZE inside try/except.
 - Build a silver_results dict and print the JSON summary.
 - Hard-fail (raise) on any error after _save_error('silver', e).",
             "gold" => @"GOLD notebook:
 - The 'prior_layer_schemas' input describes the EXACT columns now present in silver. Build dims/facts using ONLY columns that appear there.
-- BEFORE any gold write, set: spark.conf.set('spark.sql.parquet.vorder.default','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.enabled','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.binSize','1g').
-- Read silver tables into a dict keyed by lowercased table name (read from f'{tgt_base}/Tables/silver/<name>').
-- Build the dims and facts described in the spec's '## Gold' section (e.g. dim_customer, dim_product, dim_sales, fact_sales). Always alias both sides of joins (`.alias('c').join(other.alias('ca'), c.customer_id == ca.customer_id, 'left')`). Write each to f'{tgt_base}/Tables/gold/<name>'.
-- Then run the data-quality tests described in the spec's separate '## Test' section and APPEND rows to f'{tgt_base}/Tables/test/test_results'. Test rows schema: run_id STRING, test_name STRING, layer STRING, table_name STRING, status STRING (PASS/FAIL/ERROR), actual STRING, expected STRING, details STRING, checked_at TIMESTAMP. Use mode='append' option('mergeSchema','true'). Each test in its own try/except — a failing test produces a FAIL row, never crashes the cell.
+- BEFORE any gold write, set: spark.conf.set('spark.sql.parquet.vorder.default','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.enabled','true'); spark.conf.set('spark.databricks.delta.optimizeWrite.binSize','1g'). Also run spark.sql('CREATE SCHEMA IF NOT EXISTS gold') and spark.sql('CREATE SCHEMA IF NOT EXISTS test').
+- Read silver tables into a dict keyed by lowercased table name via spark.read.table(f'silver.<name>') (silver keys arrive as 'silver/<name>').
+- Build the dims and facts described in the spec's '## Gold' section (e.g. dim_customer, dim_product, dim_sales, fact_sales). Always alias both sides of joins (`.alias('c').join(other.alias('ca'), c.customer_id == ca.customer_id, 'left')`). Write each with df.write.format('delta').mode('overwrite').option('overwriteSchema','true').saveAsTable(f'gold.<name>').
+- Then run the data-quality tests described in the spec's separate '## Test' section and APPEND rows to gold-adjacent test results via df_tests.write.format('delta').mode('append').option('mergeSchema','true').saveAsTable('test.test_results'). Test rows schema: run_id STRING, test_name STRING, layer STRING, table_name STRING, status STRING (PASS/FAIL/ERROR), actual STRING, expected STRING, details STRING, checked_at TIMESTAMP. Each test in its own try/except — a failing test produces a FAIL row, never crashes the cell.
 - Build a gold_results dict + a test_summary dict and print combined JSON summary.
 - Hard-fail (raise) on any error after _save_error('gold', e). (Test failures DO NOT raise — they just write FAIL rows; only infrastructure/cell errors raise.)",
             "reporting" => @"REPORTING notebook (Power BI semantic model + report + Data Agent):
-- The 'prior_layer_schemas' input describes the EXACT columns currently sitting in gold (and test/test_results if discovered). Build TMSL columns from these — never from spec text alone.
+- The 'prior_layer_schemas' input describes the EXACT columns currently sitting in gold (and test/test_results if discovered). Keys arrive as 'gold/<table>' (and 'test/test_results'); the table name is the part after the '/'. Build TMSL columns from these — never from spec text alone.
 - import requests, base64, json, time, traceback. Get tok = notebookutils.credentials.getToken('pbi'). BASE_URL = f'https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}'.
 - Define a defensive _fabric_post(path, body) helper that returns None on non-2xx or caught exceptions. EVERY caller MUST do `if x is None: raise RuntimeError(...)` BEFORE `.get('id')`.
 - Item naming derived from target_lakehouse_name: '<name>_sm' (SemanticModel), '<name>_rpt' (Report), '<name>_agent' (AISkill).
 - 1) GET /lakehouses/{target_lakehouse_id} and poll until properties.sqlEndpointProperties.provisioningStatus == 'Success' (up to 5 min). Capture connectionString and the SQL endpoint id.
-- 2) POST /items to create a Direct Lake SemanticModel (TMSL model.bim, compatibilityLevel 1604) with tables for each discovered gold table (use the actual columns), relationships (per spec), explicit measures (per spec, PascalCase, with FORMAT strings). payloadType='InlineBase64', payload=base64(utf-8(json.dumps(tmsl_obj))), path='model.bim'.
+- 2) POST /items to create a Direct Lake SemanticModel (TMSL model.bim, compatibilityLevel 1604) with one table per discovered gold table (use the actual columns), relationships (per spec), explicit measures (per spec, PascalCase, with FORMAT strings). The TARGET LAKEHOUSE IS SCHEMA-ENABLED: each table's Direct Lake partition entity MUST set its source schema from the prior_layer_schemas KEY PREFIX — a 'gold/<table>' key uses schemaName='gold', and if you include the data-quality table its 'test/test_results' key uses schemaName='test' (entityName='test_results'). NEVER use 'dbo' and NEVER apply schemaName='gold' to a non-gold table. payloadType='InlineBase64', payload=base64(utf-8(json.dumps(tmsl_obj))), path='model.bim'.
 - 3) POST /items to create a Report (PBIR format) bound to the new SemanticModel id, with at least one page that uses the explicit measures.
 - 4) POST /items to create an AISkill data agent. Wrap in try/except so AISkill being preview-only never crashes the notebook.
 - 5) Print a final JSON summary line with semantic_model_id, report_id, data_agent_id (or null).
@@ -424,13 +426,17 @@ CELL COMMENTING (REQUIRED):
     # <optional 1-2 extra lines explaining intent>
 - The actual Python code follows. Comments explain INTENT.
 
-PLATFORM CONSTRAINTS:
-- Spark abfss paths:
+PLATFORM CONSTRAINTS (SCHEMA-ENABLED LAKEHOUSE — READ CAREFULLY):
+- The TARGET lakehouse IS SCHEMA-ENABLED and is attached as this notebook's DEFAULT lakehouse. The medallion layer separator is the SCHEMA: bronze, silver, gold, test.
+- abfss base paths (use src_base only for READING source tables; use tgt_base only for Files/ and, if you must, for reading already-written target tables):
     src_base = f""abfss://{{source_workspace_id}}@onelake.dfs.fabric.microsoft.com/{{source_lakehouse_id}}""
     tgt_base = f""abfss://{{workspace_id}}@onelake.dfs.fabric.microsoft.com/{{target_lakehouse_id}}""
-- The TARGET lakehouse IS SCHEMA-ENABLED. Layer separator is the schema prefix: bronze/, silver/, gold/, test/.
-- Always use spark.read.format('delta').load(...) and DataFrame.write.format('delta')...save(...). NEVER saveAsTable.
-- Schemas (bronze/silver/gold/test) get auto-created on first write — do NOT issue CREATE SCHEMA.
+- WRITING target tables — MANDATORY pattern. Before the first write into a schema run `spark.sql('CREATE SCHEMA IF NOT EXISTS <schema>')`, then write with saveAsTable into that schema:
+    spark.sql(""CREATE SCHEMA IF NOT EXISTS bronze"")
+    (df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy('ingestion_date').saveAsTable(f""bronze.{{flat}}""))
+  DO NOT write target tables with abfss `.save(f'{{tgt_base}}/Tables/bronze/<t>')`. On a SCHEMA-ENABLED lakehouse a raw `.save()` to a Tables/<schema>/<table> path lands the data at a BROKEN, doubly-nested `Tables/Tables/bronze/<t>` location that the SQL endpoint and the build's table-discovery step cannot see — which makes the next layer hard-fail with ""prior layer produced no discoverable tables"". saveAsTable registers the table in the schema and lands it correctly at Tables/<schema>/<table>.
+- READING target tables (prior layers): prefer `spark.read.table('<schema>.<name>')` (the default lakehouse is the target). Reading via `spark.read.format('delta').load(f'{{tgt_base}}/Tables/<schema>/<name>')` is also acceptable. Prior-layer table keys in 'prior_layer_schemas' are formatted '<schema>/<name>' — map them to the catalog name '<schema>.<name>'.
+- READING source tables: `spark.read.format('delta').load(f'{{src_base}}/Tables/<table_relative_path>')`. The source may be schema-enabled ('<schema>/<table>') or classic ('<table>') — use the value as-is.
 - Trust the notebook runtime identity for OneLake access. Never embed secrets.
 
 {layerSpec}
@@ -552,7 +558,7 @@ Apply these reference skills/agents at all times:
 - powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
 ```
 
-THEN include the standard cross-cutting code rules: defensive column references, alias-prefixed joins after every join, groupBy/agg column existence assertion, defensive REST handling with `if x is None: raise` BEFORE `.get()`, no `saveAsTable`, parameter cells, idempotent overwrite patterns, error-loud try/except that calls `_save_error(layer, e)` and re-raises.
+THEN include the standard cross-cutting code rules: defensive column references, alias-prefixed joins after every join, groupBy/agg column existence assertion, defensive REST handling with `if x is None: raise` BEFORE `.get()`, schema-qualified `saveAsTable('<schema>.<table>')` writes (after `CREATE SCHEMA IF NOT EXISTS`) into bronze/silver/gold/test — NEVER raw abfss `.save()` on the schema-enabled target lakehouse, parameter cells, idempotent overwrite patterns, error-loud try/except that calls `_save_error(layer, e)` and re-raises.
 
 THEN include the following ""Global Spark column-reference rules"" subsection VERBATIM (copy the entire block below into the Generic guidance section, preserving headings, bullets, and rule labels A–F exactly as written — do not paraphrase, abbreviate, or reorder):
 
@@ -929,10 +935,11 @@ The user just edited '## {Capitalize(editedSection)}'. Re-propose {downstreamLis
                 "\n",
                 "# Helper: persist exception details to OneLake so the web UI can surface them without Fabric monitor.\n",
                 "_error_path = f\"{tgt_base}/Files/_copilot_medallion/runs/{run_id}/error.txt\"\n",
-                "def _save_error(layer, exc):\n",
+                "def _save_error(layer, exc, table=None):\n",
                 "    try:\n",
                 "        from notebookutils import mssparkutils\n",
-                "        body = f\"[{datetime.utcnow().isoformat()}Z] LAYER={layer} RUN={run_id}\\n\\n{traceback.format_exc()}\"\n",
+                "        _tbl = f\" TABLE={table}\" if table else \"\"\n",
+                "        body = f\"[{datetime.utcnow().isoformat()}Z] LAYER={layer}{_tbl} RUN={run_id}\\n\\n{traceback.format_exc()}\"\n",
                 "        mssparkutils.fs.put(_error_path, body, True)\n",
                 "        print(f\"_save_error: wrote {_error_path}\")\n",
                 "    except Exception:\n",

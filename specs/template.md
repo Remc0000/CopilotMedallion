@@ -26,7 +26,7 @@ Also apply these reference skills (use their patterns from training):
 - **GroupBy / aggregation safety** — before any `df.groupBy(col)` or `df.agg(...)`, assert the column exists in `df.columns`. If the spec asks for aggregations by a column, the FACT table MUST materialize that column.
 - **Error-loud** — every layer wraps major steps in try/except that calls `_save_error('<layer>', e)` and re-raises. Never swallow per-table errors into a results dict and continue.
 - **Defensive REST handling (reporting notebook)** — every REST helper returns `None` on failure (non-2xx, caught exception). Callers MUST check `if x is None: raise RuntimeError(...)` BEFORE calling `.get(...)` on the result. Never write `something.get('id')` without a None check first.
-- **No saveAsTable** — schema-enabled lakehouses don't have a default DB context for unqualified saves. Always write Delta via `df.write.format('delta').save(abfss_path)`.
+- **Use saveAsTable for writes (schema-enabled lakehouse)** — the target lakehouse is schema-enabled and attached as the notebook's default lakehouse, so write Delta with schema-qualified `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').saveAsTable('<schema>.<table>')` after `spark.sql('CREATE SCHEMA IF NOT EXISTS <schema>')`. Do NOT write target tables via raw abfss `.save(path)` — on a schema-enabled lakehouse that lands the data at a broken nested `Tables/Tables/<schema>/<table>` path the SQL endpoint and discovery cannot see. (Reads may use `spark.read.table('<schema>.<table>')` or abfss `.load(...)`.)
 - **Parameter cell** — every notebook receives a platform-injected parameters cell with `workspace_id, source_workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url`. Don't redefine these.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
@@ -97,13 +97,13 @@ Rule J — Validate column existence BEFORE the expensive transform.
 - Catches missing-column bugs in a SPECIFIC cell with a SPECIFIC table name, instead of a session-wide Spark cancellation 30 minutes later that the auto-fixer can't pinpoint.
 - Especially important AFTER a select(), drop(), or rename() — re-validate before the next consumer of those columns.
 
-Rule K — Resilience to partial output: Bronze MUST write Delta tables that the next layer can discover.
-- The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs "successfully" (Spark Completed) but writes zero discoverable tables under `Tables/bronze/`, the build hard-fails with "prior layer produced no discoverable tables".
-- To guarantee discoverability, the Bronze notebook MUST:
-  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).save(f"{tgt_base}/Tables/bronze/<flat>")` for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`.
-  - Print a final summary line `print(json.dumps({"bronze_results": {<table>: {"rows": N, "path": ...}, ...}}))` listing every table actually written. Use this as a self-check.
+Rule K — Resilience to partial output: every layer MUST write Delta tables the next layer can discover.
+- The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs "successfully" (Spark Completed) but writes zero discoverable tables in the `bronze` schema, the build hard-fails with "prior layer produced no discoverable tables".
+- The target lakehouse is SCHEMA-ENABLED and attached as the default lakehouse. To guarantee discoverability, the Bronze notebook MUST:
+  - Run `spark.sql('CREATE SCHEMA IF NOT EXISTS bronze')`, then write every source table via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).saveAsTable(f"bronze.<flat>")`, where `<flat>` is the lowercased last segment of `table_relative_path`. NEVER write target tables with abfss `.save(path)` (a raw .save() to `Tables/bronze/<t>` lands at a broken nested `Tables/Tables/bronze/<t>` path discovery + SQL endpoint cannot see).
+  - Print a final summary line `print(json.dumps({"bronze_results": {<table>: {"rows": N, "target": "bronze.<flat>"}, ...}}))` listing every table actually written. Use this as a self-check.
   - Raise (not just log) if zero tables were written by the end of the notebook.
-- Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
+- Same rule applies recursively to Silver (`silver.<table>`) and Gold (`gold.<table>` + `test.test_results`) — each via `CREATE SCHEMA IF NOT EXISTS` + saveAsTable.
 
 ## Bronze
 

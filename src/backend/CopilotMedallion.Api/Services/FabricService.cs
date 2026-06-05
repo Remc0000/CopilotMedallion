@@ -532,12 +532,7 @@ public class FabricService
             var body = new {
                 displayName = name,
                 description = description ?? "",
-                // The medallion notebooks use a CLASSIC folder-based layout
-                // (Tables/bronze/<t>, Tables/silver/<t>, Tables/gold/<t>, Tables/test/test_results)
-                // and discovery parses Tables/<prefix>/<table>. Schema-enabled lakehouses use a
-                // Tables/<schema>/<table> namespace, so raw abfss .save() writes land at a broken
-                // Tables/Tables/bronze/... path the SQL endpoint and discovery can't see. Keep schemas OFF.
-                creationPayload = new { enableSchemas = false }
+                creationPayload = new { enableSchemas = true }
             };
             var resp = await c.PostAsync($"workspaces/{ws}/lakehouses",
                 new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));

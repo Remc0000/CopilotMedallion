@@ -414,25 +414,6 @@ public static class ApiEndpoints
                     }
 
                     await store.UpdateStatusAsync(run.RunId, "GeneratingNotebook");
-                    // Guard: the medallion notebooks write/read/discover classic folder paths
-                    // (Tables/bronze/<t>, Tables/silver/<t>, ...). A schema-enabled target lakehouse
-                    // uses a Tables/<schema>/<table> namespace, so raw .save() folder writes land at an
-                    // undiscoverable Tables/Tables/bronze/... path and silver discovery hard-fails.
-                    // Fail fast with a clear message instead of burning the 5-iteration auto-fix loop.
-                    try
-                    {
-                        if (await fabric.IsLakehouseSchemaEnabledAsync(tok, targetLakehouseId, ws))
-                        {
-                            var failMsg = $"Target lakehouse '{run.TargetLakehouseName}' is schema-enabled, which is incompatible with this app's folder-based medallion layout (Tables/bronze, Tables/silver, ...). Create a new medallion item so a fresh non-schema lakehouse is provisioned, then re-run.";
-                            bgLogger.LogError("Run {r}: {msg}", run.RunId, failMsg);
-                            await store.UpdateStatusAsync(run.RunId, "Failed", failMsg);
-                            return;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        bgLogger.LogWarning(ex, "Run {r}: schema-enabled check failed; proceeding", run.RunId);
-                    }
                     // Spec is now stored directly in the runs DB (canonical) — fall back to GitHub for
                     // legacy runs that don't have it.
                     var spec = run.SpecMarkdown;
