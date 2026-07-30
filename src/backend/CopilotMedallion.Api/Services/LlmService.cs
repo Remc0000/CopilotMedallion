@@ -13,6 +13,8 @@ public class LlmService
     private readonly string _defaultDeployment;
     private readonly string _apiVersion;
     private readonly string[] _availableModels;
+    private readonly string _reasoningEffort;
+    private readonly TimeSpan _timeout;
     private readonly DefaultAzureCredential _cred = new DefaultAzureCredential();
     private (string Token, DateTimeOffset ExpiresOn)? _cachedToken;
     private readonly ILogger<LlmService> _log;
@@ -28,6 +30,13 @@ public class LlmService
         _availableModels = string.IsNullOrWhiteSpace(models)
             ? new[] { _defaultDeployment }.Where(s => !string.IsNullOrEmpty(s)).ToArray()
             : models.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        // Reasoning models default to a very high internal reasoning budget. On the gpt-5.6 family
+        // that makes a single large generation call (notably the gold layer) run for >10 minutes,
+        // which blows the HTTP timeout below and surfaces as "LLM returned no cells". Pin an
+        // explicit, moderate effort unless an operator overrides it.
+        _reasoningEffort = (cfg["OpenAI:ReasoningEffort"] ?? "medium").Trim().ToLowerInvariant();
+        var timeoutMin = int.TryParse(cfg["OpenAI:TimeoutMinutes"], out var tm) && tm > 0 ? tm : 10;
+        _timeout = TimeSpan.FromMinutes(timeoutMin);
         _log = log;
         _usage = usage;
     }
@@ -62,21 +71,24 @@ public class LlmService
         var deployment = string.IsNullOrWhiteSpace(model) ? _defaultDeployment : model;
         var token = await GetTokenAsync();
         var c = _http.CreateClient();
-        c.Timeout = TimeSpan.FromMinutes(5);
+        c.Timeout = _timeout;
         c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         var url = $"{_endpoint}/openai/deployments/{deployment}/chat/completions?api-version={_apiVersion}";
 
         object body;
         if (IsReasoningModel(deployment))
         {
-            // gpt-5 / o-series: max_completion_tokens, no temperature override (must be default 1)
+            // gpt-5 / o-series: max_completion_tokens, no temperature override (must be default 1).
+            // reasoning_effort is REQUIRED here in practice: left unset, gpt-5.6-* burns an
+            // unbounded reasoning budget and a large prompt can take >10 minutes to return.
             body = new
             {
                 messages = new object[] {
                     new { role = "system", content = systemPrompt },
                     new { role = "user", content = userPrompt }
                 },
-                max_completion_tokens = Math.Max(maxTokens, 8000)
+                max_completion_tokens = Math.Max(maxTokens, 8000),
+                reasoning_effort = _reasoningEffort
             };
         }
         else
@@ -92,7 +104,17 @@ public class LlmService
             };
         }
 
-        var resp = await c.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
+        HttpResponseMessage resp;
+        try
+        {
+            resp = await c.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
+        }
+        catch (TaskCanceledException)
+        {
+            throw new TimeoutException(
+                $"LLM call timed out after {_timeout.TotalMinutes:0} min (model={deployment}, reasoning_effort={_reasoningEffort}). " +
+                "Lower OpenAI__ReasoningEffort, raise OpenAI__TimeoutMinutes, or pick a faster model.");
+        }
         var raw = await resp.Content.ReadAsStringAsync();
         if (!resp.IsSuccessStatusCode) throw new Exception($"LLM call failed {resp.StatusCode} (model={deployment}): {raw}");
         using var doc = JsonDocument.Parse(raw);
@@ -107,6 +129,19 @@ public class LlmService
             }
         }
         catch (Exception ex) { _log.LogWarning(ex, "usage recording failed"); }
-        return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+
+        var choice = doc.RootElement.GetProperty("choices")[0];
+        var content = choice.GetProperty("message").GetProperty("content").GetString() ?? "";
+        var finish = choice.TryGetProperty("finish_reason", out var fr) ? fr.GetString() : null;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            // Most commonly the whole max_completion_tokens budget was consumed by reasoning
+            // tokens, leaving nothing for the visible answer.
+            throw new Exception(
+                $"LLM returned an empty response (model={deployment}, finish_reason={finish ?? "?"}, " +
+                $"reasoning_effort={_reasoningEffort}, max_completion_tokens={Math.Max(maxTokens, 8000)}). " +
+                "Lower OpenAI__ReasoningEffort or raise the token budget.");
+        }
+        return content;
     }
 }

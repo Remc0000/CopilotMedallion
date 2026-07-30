@@ -503,7 +503,13 @@ Produce the JSON for the {layer} notebook now.";
 
         string answer;
         try { answer = await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.1, model: model, runId: runId); }
-        catch (Exception ex) { _log.LogWarning(ex, "LLM layer-cell-gen failed for {layer}", layer); return null; }
+        catch (Exception ex)
+        {
+            // Do NOT swallow this into a null return: the caller would then report the misleading
+            // "LLM did not return any notebook cells" instead of the real transport/timeout error.
+            _log.LogError(ex, "LLM layer-cell-gen failed for {layer}", layer);
+            throw new InvalidOperationException($"{layer}: LLM generation call failed — {ex.Message}", ex);
+        }
 
         var json = ExtractJson(answer);
         if (json is null)

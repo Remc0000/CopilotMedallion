@@ -141,7 +141,9 @@ az webapp config appsettings set -g $RG -n $APP --settings \
   OpenAI__Endpoint="https://$AOAI.openai.azure.com" \
   OpenAI__Deployment="gpt-5.6-sol" \
   OpenAI__Models="gpt-5.6-sol,gpt-5.4,gpt-5-mini,gpt-4.1,gpt-4o-mini" \
-  OpenAI__ApiVersion="2025-04-01-preview"
+  OpenAI__ApiVersion="2025-04-01-preview" \
+  OpenAI__ReasoningEffort="medium" \
+  OpenAI__TimeoutMinutes="10"
 ```
 
 > `Fabric__WorkspaceId` is intentionally **empty** — the workspace is resolved per-request from the Fabric workload context. Hard-coding it pins the app to one workspace.
@@ -231,6 +233,8 @@ App Service settings (`__` underscore-pairs map to `:` colons in `appsettings.js
 | `OpenAI__Deployment` | yes | Default model deployment name |
 | `OpenAI__Models` | no | Comma-list of additional deployments to show in the picker |
 | `OpenAI__ApiVersion` | no | Defaults to `2025-04-01-preview` |
+| `OpenAI__ReasoningEffort` | no | `low`/`medium`/`high` for gpt-5 / o-series. Defaults to `medium`. Leaving it unset lets the model pick an unbounded reasoning budget, which can push a single gold-layer generation past 10 minutes. |
+| `OpenAI__TimeoutMinutes` | no | HTTP timeout for LLM calls. Defaults to `10`. |
 | `GitHub__Owner` / `__RunsRepo` / `__AppRepo` | no | Optional spec history |
 | `GITHUB_PAT` | no | PAT for the runs repo; only used if all 3 GitHub keys above are set |
 | `RUN_DB_PATH` | no | SQLite path; defaults to `$HOME/data/runs.db` |
