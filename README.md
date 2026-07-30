@@ -115,9 +115,9 @@ Add **Authentication** redirect URIs (SPA platform):
 ```bash
 AOAI=mycopilot-aoai
 az cognitiveservices account create -g $RG -n $AOAI --kind OpenAI --sku S0 -l $LOCATION
-# Deploy at least one model. gpt-5.4 is preferred but gpt-4.1 is cheaper.
+# Deploy at least one model. gpt-5.6-sol is preferred but gpt-4.1 is cheaper.
 az cognitiveservices account deployment create -g $RG -n $AOAI \
-  --deployment-name gpt-5.4 --model-name gpt-5.4 --model-version "2025-08-01" \
+  --deployment-name gpt-5.6-sol --model-name gpt-5.6-sol --model-version "2026-07-09" \
   --model-format OpenAI --sku-capacity 100 --sku-name "Standard"
 ```
 
@@ -139,8 +139,8 @@ az webapp config appsettings set -g $RG -n $APP --settings \
   Fabric__WorkspaceId="" \
   Fabric__Scope="https://api.fabric.microsoft.com/.default" \
   OpenAI__Endpoint="https://$AOAI.openai.azure.com" \
-  OpenAI__Deployment="gpt-5.4" \
-  OpenAI__Models="gpt-5.4,gpt-5-mini,gpt-4.1,gpt-4o-mini" \
+  OpenAI__Deployment="gpt-5.6-sol" \
+  OpenAI__Models="gpt-5.6-sol,gpt-5.4,gpt-5-mini,gpt-4.1,gpt-4o-mini" \
   OpenAI__ApiVersion="2025-04-01-preview"
 ```
 
@@ -250,7 +250,7 @@ cd src/backend/CopilotMedallion.Api
 dotnet user-secrets set "AzureAd:TenantId" "<your-tenant>"
 dotnet user-secrets set "AzureAd:ClientId" "<your-client>"
 dotnet user-secrets set "OpenAI:Endpoint" "https://<aoai>.openai.azure.com"
-dotnet user-secrets set "OpenAI:Deployment" "gpt-5.4"
+dotnet user-secrets set "OpenAI:Deployment" "gpt-5.6-sol"
 az login    # so DefaultAzureCredential can pick up your identity for AOAI
 dotnet run
 ```
