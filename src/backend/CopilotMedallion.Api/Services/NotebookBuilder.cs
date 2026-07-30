@@ -698,6 +698,18 @@ Produce the JSON for the {layer} notebook now.";
                 && !t.StartsWith("spark") && !t.StartsWith("try") && !t.StartsWith("%"))
                 throw new InvalidOperationException(
                     $"{layer}: a generated cell does not look like Python — the model leaked prose into the output (cell starts: \"{Preview(t, 80)}\").");
+            // Guard against stray decoded tokens. Observed in the wild: a gold cell emitted as
+            // "\u53ce# ---", where the leading CJK char is a valid Python identifier, so Spark
+            // raised NameError and Fabric cancelled the whole session. Non-ASCII is legitimate
+            // inside a comment or string, but never at the start of a line of code.
+            foreach (var line in cell.Split('\n'))
+            {
+                var s = line.TrimStart();
+                if (s.Length > 0 && s[0] > 0x7F)
+                    throw new InvalidOperationException(
+                        $"{layer}: a generated line starts with a stray non-ASCII character " +
+                        $"(U+{(int)s[0]:X4}) which would raise NameError at runtime: \"{Preview(s, 60)}\".");
+            }
         }
         if (total < 800)
             throw new InvalidOperationException(
@@ -708,7 +720,6 @@ Produce the JSON for the {layer} notebook now.";
         string.IsNullOrEmpty(s) ? "(empty)"
         : s.Length <= max ? s
         : s.Substring(0, max) + "...(truncated)";
-    }
 
     /// <summary>
     /// Generate an initial spec markdown tailored to the user's picked source tables.
