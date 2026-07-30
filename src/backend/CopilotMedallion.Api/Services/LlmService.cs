@@ -65,7 +65,7 @@ public class LlmService
         return tok.Token;
     }
 
-    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2, string? model = null, string? runId = null)
+    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2, string? model = null, string? runId = null, bool jsonMode = false)
     {
         if (!Configured) throw new InvalidOperationException("Azure OpenAI not configured.");
         var deployment = string.IsNullOrWhiteSpace(model) ? _defaultDeployment : model;
@@ -76,6 +76,7 @@ public class LlmService
         var url = $"{_endpoint}/openai/deployments/{deployment}/chat/completions?api-version={_apiVersion}";
 
         object body;
+        var responseFormat = jsonMode ? new { type = "json_object" } : null;
         if (IsReasoningModel(deployment))
         {
             // gpt-5 / o-series: max_completion_tokens, no temperature override (must be default 1).
@@ -88,7 +89,8 @@ public class LlmService
                     new { role = "user", content = userPrompt }
                 },
                 max_completion_tokens = Math.Max(maxTokens, 8000),
-                reasoning_effort = _reasoningEffort
+                reasoning_effort = _reasoningEffort,
+                response_format = responseFormat
             };
         }
         else
@@ -100,14 +102,20 @@ public class LlmService
                     new { role = "user", content = userPrompt }
                 },
                 max_tokens = maxTokens,
-                temperature
+                temperature,
+                response_format = responseFormat
             };
         }
+
+        var json = JsonSerializer.Serialize(body, new JsonSerializerOptions
+        {
+            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+        });
 
         HttpResponseMessage resp;
         try
         {
-            resp = await c.PostAsync(url, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
+            resp = await c.PostAsync(url, new StringContent(json, Encoding.UTF8, "application/json"));
         }
         catch (TaskCanceledException)
         {
@@ -141,6 +149,13 @@ public class LlmService
                 $"LLM returned an empty response (model={deployment}, finish_reason={finish ?? "?"}, " +
                 $"reasoning_effort={_reasoningEffort}, max_completion_tokens={Math.Max(maxTokens, 8000)}). " +
                 "Lower OpenAI__ReasoningEffort or raise the token budget.");
+        }
+        if (string.Equals(finish, "length", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new Exception(
+                $"LLM response was truncated at the token limit (model={deployment}, " +
+                $"max_completion_tokens={Math.Max(maxTokens, 8000)}, reasoning_effort={_reasoningEffort}). " +
+                "Raise the token budget or lower OpenAI__ReasoningEffort.");
         }
         return content;
     }

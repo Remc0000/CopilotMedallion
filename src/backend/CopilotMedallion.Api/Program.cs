@@ -3,6 +3,10 @@ using CopilotMedallion.Api.Endpoints;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Persist ILogger output to the App Service filesystem/blob so background build
+// failures can actually be diagnosed after the fact (LogFiles/Application).
+builder.Logging.AddAzureWebAppDiagnostics();
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddHttpClient();

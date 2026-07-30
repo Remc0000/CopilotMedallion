@@ -344,15 +344,84 @@ Produce the JSON now.";
 
     private static string? ExtractJson(string s)
     {
-        if (string.IsNullOrEmpty(s)) return null;
+        if (string.IsNullOrWhiteSpace(s)) return null;
         s = s.Trim();
-        // strip code fences
-        var m = Regex.Match(s, @"```(?:json)?\s*([\s\S]*?)```");
-        if (m.Success) s = m.Groups[1].Value.Trim();
-        // find first '{' and last '}'
-        var i = s.IndexOf('{'); var j = s.LastIndexOf('}');
-        if (i >= 0 && j > i) return s.Substring(i, j - i + 1);
-        return null;
+
+        // Only strip a code fence when the response ACTUALLY STARTS with one.
+        // The previous version ran this regex unconditionally, which corrupted a
+        // valid raw-JSON response whose generated cell source happened to contain
+        // ``` (e.g. markdown inside a comment/docstring): the match then began
+        // mid-string and threw away most of the object.
+        if (s.StartsWith("```"))
+        {
+            var m = Regex.Match(s, @"^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n?```");
+            s = m.Success
+                ? m.Groups[1].Value.Trim()
+                : Regex.Replace(s, @"^```(?:json)?[ \t]*\r?\n?", "").TrimEnd('`', '\r', '\n', ' ').Trim();
+        }
+
+        var start = s.IndexOf('{');
+        if (start < 0) return null;
+
+        // Brace-match while respecting string literals and escapes. Taking the LAST
+        // '}' in the text (the old behaviour) is wrong whenever a generated Python
+        // cell contains braces — e.g. an f-string like f"bronze.{flat}" — because
+        // trailing prose after the object would be swallowed into the JSON.
+        int depth = 0; bool inStr = false, esc = false;
+        for (int i = start; i < s.Length; i++)
+        {
+            var ch = s[i];
+            if (inStr)
+            {
+                if (esc) esc = false;
+                else if (ch == '\\') esc = true;
+                else if (ch == '"') inStr = false;
+                continue;
+            }
+            if (ch == '"') inStr = true;
+            else if (ch == '{') depth++;
+            else if (ch == '}' && --depth == 0) return s.Substring(start, i - start + 1);
+        }
+        return null; // unbalanced -> the response was truncated
+    }
+
+    /// <summary>
+    /// Escapes raw control characters that appear INSIDE JSON string literals.
+    /// Models frequently emit a literal newline/tab inside a generated code string,
+    /// which is invalid JSON and makes JsonDocument.Parse throw even though the
+    /// payload is otherwise perfectly well-formed.
+    /// </summary>
+    private static string RepairJsonControlChars(string json)
+    {
+        var sb = new StringBuilder(json.Length + 64);
+        bool inStr = false, esc = false;
+        foreach (var ch in json)
+        {
+            if (inStr)
+            {
+                if (esc) { sb.Append(ch); esc = false; continue; }
+                if (ch == '\\') { sb.Append(ch); esc = true; continue; }
+                if (ch == '"') { sb.Append(ch); inStr = false; continue; }
+                if (ch < 0x20)
+                {
+                    sb.Append(ch switch
+                    {
+                        '\n' => "\\n",
+                        '\r' => "\\r",
+                        '\t' => "\\t",
+                        '\b' => "\\b",
+                        '\f' => "\\f",
+                        _ => "\\u" + ((int)ch).ToString("x4")
+                    });
+                    continue;
+                }
+                sb.Append(ch);
+                continue;
+            }
+            if (ch == '"') inStr = true;
+            sb.Append(ch);
+        }
+        return sb.ToString();
     }
 
     /// <summary>
@@ -501,8 +570,42 @@ source_tables_csv = {string.Join(",", sourceTables)}
 
 Produce the JSON for the {layer} notebook now.";
 
+        // gpt-5.6 intermittently produces a degenerate answer for this task: it either leaks
+        // reasoning text into a cell or elides the body with a "..." placeholder, and sometimes
+        // abandons the JSON mid-object. Measured on identical silver prompts: 3/6 usable without
+        // response_format, 6/6 with json_object. Keep JSON mode AND retry, since neither the model
+        // nor JSON mode guarantees non-elided content.
+        const int maxAttempts = 3;
+        Exception? last = null;
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                var cells = await GenerateLayerCellsOnceAsync(layer, system, user, model, runId);
+                if (attempt > 1)
+                    _log.LogInformation("Layer {layer} generation succeeded on attempt {n}", layer, attempt);
+                return cells;
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or JsonException)
+            {
+                last = ex;
+                _log.LogWarning("Layer {layer} generation attempt {n}/{max} unusable: {msg}",
+                    layer, attempt, maxAttempts, ex.Message);
+            }
+        }
+        throw new InvalidOperationException(
+            $"{layer}: the model returned an unusable notebook {maxAttempts} times in a row. Last problem — {last?.Message}", last);
+    }
+
+    private async Task<List<string>> GenerateLayerCellsOnceAsync(
+        string layer, string system, string user, string? model, string runId)
+    {
         string answer;
-        try { answer = await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.1, model: model, runId: runId); }
+        try
+        {
+            answer = await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.1,
+                model: model, runId: runId, jsonMode: true);
+        }
         catch (Exception ex)
         {
             // Do NOT swallow this into a null return: the caller would then report the misleading
@@ -514,28 +617,97 @@ Produce the JSON for the {layer} notebook now.";
         var json = ExtractJson(answer);
         if (json is null)
         {
-            _log.LogWarning("Could not find JSON in LLM response for {layer}. Raw preview: {preview}",
-                layer, answer.Length > 800 ? answer.Substring(0, 800) + "...(truncated)" : answer);
-            return null;
+            var preview = Preview(answer);
+            _log.LogWarning("Could not find JSON in LLM response for {layer}. Raw preview: {preview}", layer, preview);
+            throw new InvalidOperationException(
+                $"{layer}: could not locate a complete JSON object in the LLM response " +
+                $"(length {answer.Length}; likely truncated or unbalanced). Response starts: {preview}");
         }
-        try
+
+        JsonDocument doc;
+        try { doc = JsonDocument.Parse(json); }
+        catch (JsonException)
         {
-            using var doc = JsonDocument.Parse(json);
-            if (doc.RootElement.TryGetProperty("cells", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            // Retry once after escaping raw control characters inside string literals.
+            try { doc = JsonDocument.Parse(RepairJsonControlChars(json)); }
+            catch (JsonException ex2)
             {
-                var list = ReadStringArray(arr);
-                if (list.Count > 0) return list;
+                _log.LogWarning(ex2, "LLM JSON parse failed for {layer}. Preview: {preview}", layer, Preview(json));
+                throw new InvalidOperationException(
+                    $"{layer}: the LLM response was not valid JSON even after repair — {ex2.Message}. " +
+                    $"Response starts: {Preview(json)}");
             }
-            // Be lenient: some models return { "<layer>": [...] } instead of { "cells": [...] }.
-            if (doc.RootElement.TryGetProperty(layer, out var arr2) && arr2.ValueKind == JsonValueKind.Array)
-            {
-                var list = ReadStringArray(arr2);
-                if (list.Count > 0) return list;
-            }
-            _log.LogWarning("LLM response for {layer} missing 'cells' array", layer);
-            return null;
         }
-        catch (Exception ex) { _log.LogWarning(ex, "LLM JSON parse failed for {layer}", layer); return null; }
+
+        using (doc)
+        {
+            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                if (doc.RootElement.TryGetProperty("cells", out var arr) && arr.ValueKind == JsonValueKind.Array)
+                {
+                    var list = ReadStringArray(arr);
+                    if (list.Count > 0) { ValidateCells(layer, list); return list; }
+                }
+                // Be lenient: some models return { "<layer>": [...] } instead of { "cells": [...] }.
+                if (doc.RootElement.TryGetProperty(layer, out var arr2) && arr2.ValueKind == JsonValueKind.Array)
+                {
+                    var list = ReadStringArray(arr2);
+                    if (list.Count > 0) { ValidateCells(layer, list); return list; }
+                }
+                // ...or a single-key object whose only value is the array.
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.Array)
+                    {
+                        var list = ReadStringArray(prop.Value);
+                        if (list.Count > 0) { ValidateCells(layer, list); return list; }
+                    }
+                }
+            }
+            else if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                var list = ReadStringArray(doc.RootElement);
+                if (list.Count > 0) { ValidateCells(layer, list); return list; }
+            }
+
+            _log.LogWarning("LLM response for {layer} contained no usable cells array. Preview: {preview}",
+                layer, Preview(json));
+            throw new InvalidOperationException(
+                $"{layer}: the LLM returned JSON with no non-empty 'cells' array. Response starts: {Preview(json)}");
+        }
+    }
+
+    /// <summary>
+    /// Rejects the degenerate answers gpt-5.6 intermittently produces for this task:
+    /// a "..." placeholder standing in for the real code, a cell containing leaked
+    /// reasoning prose instead of Python, or a notebook far too small to be real.
+    /// Returning these would deploy a broken notebook that fails at Spark runtime.
+    /// </summary>
+    private static void ValidateCells(string layer, List<string> cells)
+    {
+        var total = cells.Sum(c => c.Length);
+        foreach (var cell in cells)
+        {
+            var t = cell.Trim();
+            if (t.Length < 20 || t.TrimEnd('.', ' ', '\r', '\n').Length == 0)
+                throw new InvalidOperationException(
+                    $"{layer}: the model elided a cell with a placeholder instead of emitting code (cell: \"{Preview(t, 80)}\").");
+            // Real cells always begin with the mandated '# ---' comment banner or an import/
+            // statement. A cell that starts mid-sentence is leaked chain-of-thought.
+            if (!t.StartsWith("#") && !t.StartsWith("import ") && !t.StartsWith("from ")
+                && !t.StartsWith("spark") && !t.StartsWith("try") && !t.StartsWith("%"))
+                throw new InvalidOperationException(
+                    $"{layer}: a generated cell does not look like Python — the model leaked prose into the output (cell starts: \"{Preview(t, 80)}\").");
+        }
+        if (total < 800)
+            throw new InvalidOperationException(
+                $"{layer}: the generated notebook is implausibly small ({total} chars across {cells.Count} cells).");
+    }
+
+    private static string Preview(string s, int max = 600) =>
+        string.IsNullOrEmpty(s) ? "(empty)"
+        : s.Length <= max ? s
+        : s.Substring(0, max) + "...(truncated)";
     }
 
     /// <summary>
