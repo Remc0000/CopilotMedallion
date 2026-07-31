@@ -65,7 +65,7 @@ public class LlmService
         return tok.Token;
     }
 
-    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2, string? model = null, string? runId = null, bool jsonMode = false)
+    public async Task<string> ChatAsync(string systemPrompt, string userPrompt, int maxTokens = 4096, double temperature = 0.2, string? model = null, string? runId = null, bool jsonMode = false, string? reasoningEffort = null)
     {
         if (!Configured) throw new InvalidOperationException("Azure OpenAI not configured.");
         var deployment = string.IsNullOrWhiteSpace(model) ? _defaultDeployment : model;
@@ -77,6 +77,9 @@ public class LlmService
 
         object body;
         var responseFormat = jsonMode ? new { type = "json_object" } : null;
+        // A caller may override the configured effort per-call (the layer generator escalates
+        // across attempts). null/empty means "use the configured default".
+        var effort = string.IsNullOrWhiteSpace(reasoningEffort) ? _reasoningEffort : reasoningEffort.Trim().ToLowerInvariant();
         if (IsReasoningModel(deployment))
         {
             // gpt-5 / o-series: max_completion_tokens, no temperature override (must be default 1).
@@ -89,7 +92,7 @@ public class LlmService
                     new { role = "user", content = userPrompt }
                 },
                 max_completion_tokens = Math.Max(maxTokens, 8000),
-                reasoning_effort = _reasoningEffort,
+                reasoning_effort = effort,
                 response_format = responseFormat
             };
         }
@@ -120,7 +123,7 @@ public class LlmService
         catch (TaskCanceledException)
         {
             throw new TimeoutException(
-                $"LLM call timed out after {_timeout.TotalMinutes:0} min (model={deployment}, reasoning_effort={_reasoningEffort}). " +
+                $"LLM call timed out after {_timeout.TotalMinutes:0} min (model={deployment}, reasoning_effort={effort}). " +
                 "Lower OpenAI__ReasoningEffort, raise OpenAI__TimeoutMinutes, or pick a faster model.");
         }
         var raw = await resp.Content.ReadAsStringAsync();
@@ -147,14 +150,14 @@ public class LlmService
             // tokens, leaving nothing for the visible answer.
             throw new Exception(
                 $"LLM returned an empty response (model={deployment}, finish_reason={finish ?? "?"}, " +
-                $"reasoning_effort={_reasoningEffort}, max_completion_tokens={Math.Max(maxTokens, 8000)}). " +
+                $"reasoning_effort={effort}, max_completion_tokens={Math.Max(maxTokens, 8000)}). " +
                 "Lower OpenAI__ReasoningEffort or raise the token budget.");
         }
         if (string.Equals(finish, "length", StringComparison.OrdinalIgnoreCase))
         {
             throw new Exception(
                 $"LLM response was truncated at the token limit (model={deployment}, " +
-                $"max_completion_tokens={Math.Max(maxTokens, 8000)}, reasoning_effort={_reasoningEffort}). " +
+                $"max_completion_tokens={Math.Max(maxTokens, 8000)}, reasoning_effort={effort}). " +
                 "Raise the token budget or lower OpenAI__ReasoningEffort.");
         }
         return content;

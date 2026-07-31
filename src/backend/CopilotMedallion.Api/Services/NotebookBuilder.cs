@@ -505,18 +505,21 @@ Produce the JSON now.";
 You are operating as the FabricDataEngineer agent (https://github.com/microsoft/skills-for-fabric/blob/main/agents/FabricDataEngineer.agent.md). Apply ALL of its core principles: decompose by endpoint-specific stage, parameterize, use Delta everywhere, idempotent overwrite patterns, validation gates, error-loud try/except.
 
 OUTPUT FORMAT (STRICT):
-Return ONLY a JSON object with this exact shape:
-{{
-  ""cells"": [""<cell1 source code>"", ""<cell2 source code>"", ...]
-}}
-No prose, no markdown fences. Each cell is a complete Python source string. The platform supplies a parameters cell (workspace_id, source_workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url) and a bootstrap cell defining src_base, tgt_base, source_tables, _save_error — DO NOT redefine these. Aim for 4-7 cells, ~80-120 lines total.
+Return ONLY a JSON object with exactly one key, ""cells"", whose value is an array of strings.
+Each array element is the COMPLETE Python source of one notebook cell.
+Never emit a placeholder, an ellipsis, an angle-bracket token or any commentary as an array
+element — every element must be runnable Python on its own. Never truncate a cell.
+No prose, no markdown fences. The platform supplies a parameters cell (workspace_id, source_workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url) and a bootstrap cell defining src_base, tgt_base, source_tables, _save_error — DO NOT redefine these. Aim for 4-7 cells, ~80-120 lines total.
 
 CELL COMMENTING (REQUIRED):
-- Every cell MUST begin with a comment block:
+- Every cell MUST begin with a comment block whose FIRST LINE is exactly the three characters
+  '#', ' ', '---' (i.e. `# ---`). The '#' is mandatory — a line of bare dashes is a Python
+  syntax error:
     # ---
     # <one-line summary of the cell>
     # <optional 1-2 extra lines explaining intent>
 - The actual Python code follows. Comments explain INTENT.
+- Use ASCII only outside of string literals.
 
 PLATFORM CONSTRAINTS (SCHEMA-ENABLED LAKEHOUSE — READ CAREFULLY):
 - The TARGET lakehouse IS SCHEMA-ENABLED and is attached as this notebook's DEFAULT lakehouse. The medallion layer separator is the SCHEMA: bronze, silver, gold, test.
@@ -570,41 +573,55 @@ source_tables_csv = {string.Join(",", sourceTables)}
 
 Produce the JSON for the {layer} notebook now.";
 
-        // gpt-5.6 intermittently produces a degenerate answer for this task: it either leaks
-        // reasoning text into a cell or elides the body with a "..." placeholder, and sometimes
-        // abandons the JSON mid-object. Measured on identical silver prompts: 3/6 usable without
-        // response_format, 6/6 with json_object. Keep JSON mode AND retry, since neither the model
-        // nor JSON mode guarantees non-elided content.
-        const int maxAttempts = 3;
-        Exception? last = null;
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        // gpt-5.6 intermittently produces a degenerate answer for this task: it drops the '#'
+        // from the mandatory banner, echoes a placeholder from the output-format example, leaks
+        // reasoning prose into a cell, or injects a stray non-ASCII token. Measured over 12
+        // attempts on the real ~11k-token bronze prompt, gpt-5.6-sol produced a usable notebook
+        // 6/12 times regardless of effort/budget, while gpt-5.4 produced 8/8. So escalate effort
+        // and budget first (retrying an IDENTICAL request is wasteful), then fall back to gpt-5.4.
+        const string FallbackModel = "gpt-5.4";
+        var ladder = new (string? Model, string? Effort, int MaxTokens)[]
         {
+            (null,           null,     32000),  // requested model, configured effort (medium)
+            (null,           "low",    32000),
+            (FallbackModel,  "medium", 32000),
+            (FallbackModel,  "low",    32000)
+        };
+        Exception? last = null;
+        for (var attempt = 0; attempt < ladder.Length; attempt++)
+        {
+            var (ladderModel, effort, budget) = ladder[attempt];
+            // If the caller already asked for the fallback model, the later rungs still differ by
+            // reasoning effort, so no attempt is ever an exact repeat of an earlier one.
+            var useModel = ladderModel ?? model;
             try
             {
-                var cells = await GenerateLayerCellsOnceAsync(layer, system, user, model, runId);
-                if (attempt > 1)
-                    _log.LogInformation("Layer {layer} generation succeeded on attempt {n}", layer, attempt);
+                var cells = await GenerateLayerCellsOnceAsync(layer, system, user, useModel, runId, effort, budget);
+                if (attempt > 0)
+                    _log.LogInformation("Layer {layer} generation succeeded on attempt {n} (model={m}, effort={e}, budget={b})",
+                        layer, attempt + 1, useModel ?? "default", effort ?? "default", budget);
                 return cells;
             }
             catch (Exception ex) when (ex is InvalidOperationException or JsonException)
             {
                 last = ex;
-                _log.LogWarning("Layer {layer} generation attempt {n}/{max} unusable: {msg}",
-                    layer, attempt, maxAttempts, ex.Message);
+                _log.LogWarning("Layer {layer} generation attempt {n}/{max} unusable (model={m}, effort={e}, budget={b}): {msg}",
+                    layer, attempt + 1, ladder.Length, useModel ?? "default", effort ?? "default", budget, ex.Message);
             }
         }
         throw new InvalidOperationException(
-            $"{layer}: the model returned an unusable notebook {maxAttempts} times in a row. Last problem — {last?.Message}", last);
+            $"{layer}: the model returned an unusable notebook {ladder.Length} times in a row. Last problem — {last?.Message}", last);
     }
 
     private async Task<List<string>> GenerateLayerCellsOnceAsync(
-        string layer, string system, string user, string? model, string runId)
+        string layer, string system, string user, string? model, string runId,
+        string? reasoningEffort, int maxTokens)
     {
         string answer;
         try
         {
-            answer = await _llm.ChatAsync(system, user, maxTokens: 16000, temperature: 0.1,
-                model: model, runId: runId, jsonMode: true);
+            answer = await _llm.ChatAsync(system, user, maxTokens: maxTokens, temperature: 0.1,
+                model: model, runId: runId, jsonMode: true, reasoningEffort: reasoningEffort);
         }
         catch (Exception ex)
         {
@@ -646,13 +663,13 @@ Produce the JSON for the {layer} notebook now.";
                 if (doc.RootElement.TryGetProperty("cells", out var arr) && arr.ValueKind == JsonValueKind.Array)
                 {
                     var list = ReadStringArray(arr);
-                    if (list.Count > 0) { ValidateCells(layer, list); return list; }
+                    if (list.Count > 0) { list = RepairCells(list); ValidateCells(layer, list); return list; }
                 }
                 // Be lenient: some models return { "<layer>": [...] } instead of { "cells": [...] }.
                 if (doc.RootElement.TryGetProperty(layer, out var arr2) && arr2.ValueKind == JsonValueKind.Array)
                 {
                     var list = ReadStringArray(arr2);
-                    if (list.Count > 0) { ValidateCells(layer, list); return list; }
+                    if (list.Count > 0) { list = RepairCells(list); ValidateCells(layer, list); return list; }
                 }
                 // ...or a single-key object whose only value is the array.
                 foreach (var prop in doc.RootElement.EnumerateObject())
@@ -660,14 +677,14 @@ Produce the JSON for the {layer} notebook now.";
                     if (prop.Value.ValueKind == JsonValueKind.Array)
                     {
                         var list = ReadStringArray(prop.Value);
-                        if (list.Count > 0) { ValidateCells(layer, list); return list; }
+                        if (list.Count > 0) { list = RepairCells(list); ValidateCells(layer, list); return list; }
                     }
                 }
             }
             else if (doc.RootElement.ValueKind == JsonValueKind.Array)
             {
                 var list = ReadStringArray(doc.RootElement);
-                if (list.Count > 0) { ValidateCells(layer, list); return list; }
+                if (list.Count > 0) { list = RepairCells(list); ValidateCells(layer, list); return list; }
             }
 
             _log.LogWarning("LLM response for {layer} contained no usable cells array. Preview: {preview}",
@@ -675,6 +692,31 @@ Produce the JSON for the {layer} notebook now.";
             throw new InvalidOperationException(
                 $"{layer}: the LLM returned JSON with no non-empty 'cells' array. Response starts: {Preview(json)}");
         }
+    }
+
+    /// <summary>
+    /// Repairs the one defect that is unambiguous and safe to fix: a mangled leading comment
+    /// banner. The model intermittently drops the '#' from the mandatory `# ---` first line,
+    /// leaving a bare `---` (or `- ---`) which is a Python syntax error even though the rest of
+    /// the cell is fine. Anything less clear-cut is left alone for ValidateCells to reject.
+    /// </summary>
+    private static List<string> RepairCells(List<string> cells)
+    {
+        var fixedCells = new List<string>(cells.Count);
+        foreach (var cell in cells)
+        {
+            var lines = cell.Split('\n');
+            var first = lines[0].Trim();
+            // A first line made up only of dashes/spaces is a banner that lost its '#'.
+            if (first.Length > 0 && first.Replace("-", "").Replace(" ", "").Length == 0 && first.Contains("--"))
+            {
+                lines[0] = "# ---";
+                fixedCells.Add(string.Join("\n", lines));
+                continue;
+            }
+            fixedCells.Add(cell);
+        }
+        return fixedCells;
     }
 
     /// <summary>
